@@ -1,0 +1,26 @@
+
+
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+venv/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Training outputs (do not commit)
+data/
+ckpt/
+ckpt_expert/
+runs/
+*.npz
+*.pt
+*.pth
+
