@@ -5,6 +5,7 @@ import glob
 import math
 import argparse
 import random
+from collections import OrderedDict
 from typing import List, Tuple, Iterator, Dict
 import numpy as np
 import torch
@@ -19,21 +20,26 @@ class SelfPlayDataset:
     从目录下的 .npz 分片中随机采样样本 (feats[C,8,8], pi[4672], z[1])。
     支持动态 padding/裁剪特征通道到 in_planes。
     """
-    def __init__(self, shards_dir: str, in_planes: int = 102):
+    def __init__(self, shards_dir: str, in_planes: int = 102, max_cached_files: int = 64):
         self.files = sorted(glob.glob(os.path.join(shards_dir, "*.npz")))
         if not self.files:
             raise FileNotFoundError(f"No .npz shards in {shards_dir}")
         self.in_planes = in_planes
-        self._cache: Dict[str, Dict[str, np.ndarray]] = {}
+        self.max_cached_files = max_cached_files
+        self._cache: "OrderedDict[str, Dict[str, np.ndarray]]" = OrderedDict()
 
     def __len__(self):
         # 不能准确返回全集大小；训练时用 steps_per_epoch 控制
         return 10**9
 
     def _load_file(self, path: str) -> Dict[str, np.ndarray]:
-        if path not in self._cache:
-            data = np.load(path)
-            self._cache[path] = {"feats": data["feats"], "pi": data["pi"], "z": data["z"]}
+        if path in self._cache:
+            self._cache.move_to_end(path)
+            return self._cache[path]
+        data = np.load(path)
+        self._cache[path] = {"feats": data["feats"], "pi": data["pi"], "z": data["z"]}
+        if len(self._cache) > self.max_cached_files:
+            self._cache.popitem(last=False)
         return self._cache[path]
 
     def sample(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:

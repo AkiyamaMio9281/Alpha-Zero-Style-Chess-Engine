@@ -6,23 +6,7 @@ import chess
 
 from engine import EncodeConfig, legal_moves_index_map, ACTION_SIZE, encode_board
 from mcts import MCTS, MCTSConfig
-# Prefer the user's net.predict if present; else fall back to a minimal local builder.
-try:
-    from predict import load_predictor
-except Exception:
-    # Fallback: minimal predictor via model.py
-    from model import load_model, ModelConfig
-    import torch
-    def load_predictor(checkpoint, in_planes=102, channels=128, resblocks=12, amp=False, device=None):
-        dev = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
-        m = load_model(checkpoint, cfg=ModelConfig(in_planes, channels, resblocks), device=dev)
-        m.eval()
-        def pred(feats_batch: List[np.ndarray]):
-            x = torch.from_numpy(np.stack(feats_batch).astype(np.float32)).to(dev)
-            with torch.no_grad():
-                pl, v = m(x)
-            return pl.cpu().numpy().astype(np.float32), v.cpu().numpy().astype(np.float32)
-        return pred
+from predict import load_predictor
 
 def build_ai(checkpoint: str, device: str, channels: int, resblocks: int, in_planes: int):
     predict = load_predictor(

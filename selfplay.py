@@ -1,18 +1,14 @@
 # selfplay.py
 from __future__ import annotations
-import engine
 import os
 import time
 import uuid
 import argparse
 import threading
-from typing import List, Tuple, Callable, Optional
-import queue
+from typing import List, Tuple, Callable
 import numpy as np
 import chess
 from engine import legal_moves_index_map, ACTION_SIZE
-
-
 
 from engine import (
     EncodeConfig,
@@ -20,6 +16,7 @@ from engine import (
     board_outcome_to_z,
 )
 from mcts import MCTS, MCTSConfig
+from net.batch_predict import make_batched_predictor
 
 # ===== 即时日志 =====
 def log(*a, **k):
@@ -31,70 +28,6 @@ def dummy_predict(feats_batch: List[np.ndarray]):
     logits = np.zeros((B, 4672), dtype=np.float32)
     values = np.zeros((B,), dtype=np.float32)
     return logits, values
-
-# ===== 可选：小型批量推理聚合器（把多个线程的叶子攒成 batch 一起推理）=====
-class _Req:
-    __slots__ = ("x", "evt", "out_logits", "out_value")
-    def __init__(self, x: np.ndarray):
-        self.x = x
-        self.evt = threading.Event()
-        self.out_logits: Optional[np.ndarray] = None
-        self.out_value: Optional[float] = None
-
-class PredictBatcher:
-    def __init__(self, base_predict: Callable[[List[np.ndarray]], Tuple[np.ndarray, np.ndarray]],
-                 max_batch: int = 128, max_wait_ms: int = 5):
-        self.base_predict = base_predict
-        self.max_batch = max_batch
-        self.max_wait_ms = max_wait_ms
-        self.q: "queue.Queue[_Req]" = queue.Queue()
-        self.stop = False
-        self.th = threading.Thread(target=self._loop, daemon=True)
-        self.th.start()
-
-    def _loop(self):
-        while not self.stop:
-            try:
-                first = self.q.get(timeout=0.01)
-            except queue.Empty:
-                continue
-            batch = [first]
-            t0 = time.time()
-            while len(batch) < self.max_batch:
-                remain = self.max_wait_ms/1000.0 - (time.time() - t0)
-                if remain <= 0: break
-                try:
-                    nxt = self.q.get(timeout=remain)
-                    batch.append(nxt)
-                except queue.Empty:
-                    break
-            xs = [r.x for r in batch]
-            logits, values = self.base_predict(xs)  # (B,A), (B,)
-            for i, r in enumerate(batch):
-                r.out_logits = logits[i]
-                r.out_value  = float(values[i])
-                r.evt.set()
-
-    def predict_one(self, x: np.ndarray) -> Tuple[np.ndarray, float]:
-        r = _Req(x)
-        self.q.put(r)
-        r.evt.wait()
-        return r.out_logits, r.out_value  # type: ignore
-
-def make_batched_predictor(base_predict: Callable[[List[np.ndarray]], Tuple[np.ndarray, np.ndarray]],
-                           max_batch: int, max_wait_ms: int):
-    """
-    返回与 base_predict 相同签名的函数，但内部用队列把每个样本汇聚成大 batch。
-    """
-    batcher = PredictBatcher(base_predict, max_batch=max_batch, max_wait_ms=max_wait_ms)
-    def predict(feats_batch: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
-        outs_logits, outs_values = [], []
-        for x in feats_batch:
-            lg, v = batcher.predict_one(x)
-            outs_logits.append(lg)
-            outs_values.append(v)
-        return np.stack(outs_logits), np.asarray(outs_values, dtype=np.float32)
-    return predict
 
 def _can_force_draw(board: chess.Board) -> bool:
     try:
@@ -222,25 +155,7 @@ def _build_predict_fn(args) -> Callable[[List[np.ndarray]], Tuple[np.ndarray, np
     # 选择预测器：如提供 checkpoint 就加载真模型；否则用 dummy
     if args.checkpoint and args.checkpoint.strip().lower() not in ("", "none"):
         try:
-            # 为了兼容你后来把 net.model 改成 model，这里优先尝试 net.predict，再从 model 中兜底
-            try:
-                from predict import load_predictor  # 先尝试包路径
-            except Exception:
-                # 直接从顶层 model 导入
-                import importlib
-                mod = importlib.import_module("model")
-                def load_predictor(checkpoint, in_planes=102, channels=128, resblocks=12, amp=True, device=None):
-                    m = mod.load_model(checkpoint, cfg=mod.ModelConfig(in_planes, channels, resblocks),
-                                       device=(device if device else None))
-                    # 期望 mod 里有 predict(model, feats) 或 model(feats)
-                    def pred(feats_list: List[np.ndarray]):
-                        import torch, numpy as _np
-                        x = _np.stack(feats_list).astype(_np.float32)
-                        x = torch.from_numpy(x).to(next(m.parameters()).device)
-                        with torch.no_grad():
-                            pl, v = m(x)
-                        return pl.detach().float().cpu().numpy(), v.detach().float().cpu().numpy()
-                    return pred
+            from predict import load_predictor
             base_predict = load_predictor(
                 checkpoint=args.checkpoint,
                 in_planes=102, channels=args.channels, resblocks=args.resblocks,

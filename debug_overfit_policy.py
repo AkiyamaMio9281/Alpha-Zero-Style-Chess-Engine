@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 import chess
 
-from engine import EncodeConfig, encode_board, legal_moves_index_map, move_to_index
+from engine import EncodeConfig, encode_board, legal_moves_index_map, move_to_index, ACTION_SIZE
 from model import load_model, ModelConfig
 
 def main():
@@ -46,9 +46,6 @@ def main():
             break
     if tgt_idx is None:
         raise SystemExit("Mapping error: target move not found in legal_moves_index_map")
-    pi = np.zeros((len(mp) * 73), dtype=np.float32)  # wrong shape on purpose to force use of ACTION_SIZE?
-    # Actually we need ACTION_SIZE
-    from engine import ACTION_SIZE
     pi = np.zeros((ACTION_SIZE,), dtype=np.float32)
     pi[tgt_idx] = 1.0
     y = torch.from_numpy(pi[None]).to(dev)

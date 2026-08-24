@@ -36,7 +36,6 @@ import uuid
 import argparse
 import threading
 from typing import List, Tuple, Callable, Optional, Dict
-import queue
 import numpy as np
 import chess
 import chess.engine as ce
@@ -50,8 +49,7 @@ from engine import (
     legal_moves_index_map,
     board_outcome_to_z,
 )
-
-allow_resign = False  # 默认关
+from net.batch_predict import make_batched_predictor
 
 
 # ------------------------------
@@ -147,82 +145,11 @@ class UCIExpert:
         return {}
 
 # ------------------------------
-# Batched predictor helper
-# ------------------------------
-_Req = Tuple[np.ndarray, "queue.Queue[Tuple[np.ndarray, float]]"]
-
-class PredictBatcher:
-    def __init__(self, base_predict: Callable[[List[np.ndarray]], Tuple[np.ndarray, np.ndarray]],
-                 max_batch: int = 128, max_wait_ms: int = 5):
-        self.base_predict = base_predict
-        self.max_batch = max_batch
-        self.max_wait_ms = max_wait_ms
-        self.q: "queue.Queue[_Req]" = queue.Queue()
-        self.stop = False
-        self.th = threading.Thread(target=self._loop, daemon=True)
-        self.th.start()
-
-    def _loop(self):
-        while not self.stop:
-            try:
-                first = self.q.get(timeout=0.01)
-            except queue.Empty:
-                continue
-            batch = [first]
-            t0 = time.time()
-            while len(batch) < self.max_batch:
-                remain = self.max_wait_ms / 1000.0 - (time.time() - t0)
-                if remain <= 0:
-                    break
-                try:
-                    nxt = self.q.get(timeout=remain)
-                    batch.append(nxt)
-                except queue.Empty:
-                    break
-            feats_batch = [x for x, _ in batch]
-            logits, values = self.base_predict(feats_batch)
-            for i, (_, out_q) in enumerate(batch):
-                out_q.put((logits[i], float(values[i])))
-
-    def predict_one(self, x: np.ndarray) -> Tuple[np.ndarray, float]:
-        out_q: "queue.Queue[Tuple[np.ndarray, float]]" = queue.Queue(maxsize=1)
-        self.q.put((x, out_q))
-        logits, v = out_q.get()
-        return logits, v
-
-def make_batched_predictor(base_predict: Callable[[List[np.ndarray]], Tuple[np.ndarray, np.ndarray]],
-                           max_batch: int, max_wait_ms: int):
-    batcher = PredictBatcher(base_predict, max_batch=max_batch, max_wait_ms=max_wait_ms)
-    def predict(feats_batch: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
-        outs_logits, outs_values = [], []
-        for x in feats_batch:
-            lg, v = batcher.predict_one(x)
-            outs_logits.append(lg)
-            outs_values.append(v)
-        return np.stack(outs_logits), np.asarray(outs_values, dtype=np.float32)
-    return predict
-
-# ------------------------------
 # Predictor builder
 # ------------------------------
 def build_predictor(args) -> Callable[[List[np.ndarray]], Tuple[np.ndarray, np.ndarray]]:
     if args.checkpoint and args.checkpoint.strip().lower() not in ("", "none"):
-        try:
-            from predict import load_predictor
-        except Exception:
-            import importlib, torch
-            mod = importlib.import_module("model")
-            def load_predictor(checkpoint, in_planes=102, channels=128, resblocks=12, amp=True, device=None):
-                m = mod.load_model(checkpoint, cfg=mod.ModelConfig(in_planes, channels, resblocks),
-                                   device=(device if device else None))
-                m.eval()
-                def pred(feats_list: List[np.ndarray]):
-                    x = np.stack(feats_list).astype(np.float32)
-                    xt = torch.from_numpy(x).to(next(m.parameters()).device)
-                    with torch.no_grad():
-                        pl, v = m(xt)
-                    return pl.detach().float().cpu().numpy(), v.detach().float().cpu().numpy()
-                return pred
+        from predict import load_predictor
         base_predict = load_predictor(
             checkpoint=args.checkpoint,
             in_planes=102, channels=args.channels, resblocks=args.resblocks,
@@ -292,6 +219,7 @@ def play_one_game_vs_expert(predict_fn,
         print(f"[game] start vs UCI {'W' if expert_color_white else 'B'}  stm={'W' if board.turn else 'B'}")
 
     forced_draw = False
+    resigned_side_white: Optional[bool] = None
     while True:
         if board.is_game_over(claim_draw=True):
             break
@@ -307,8 +235,8 @@ def play_one_game_vs_expert(predict_fn,
                 if bad_counter >= resign_plies:
                     if not quiet:
                         print(f"[game] resign triggered at ply {move_no} (cp={cp})")
-                    if allow_resign:
-                        pass  
+                    resigned_side_white = board.turn
+                    break
             else:
                 bad_counter = 0
 
@@ -323,12 +251,12 @@ def play_one_game_vs_expert(predict_fn,
         if side_is_expert:
             # Expert distribution
             dist = expert.distribution(board, multipv=expert_multipv, movetime_ms=expert_movetime)
+            move_to_idx = {mv_leg: a_idx for a_idx, mv_leg in legal_map.items()}
             pi_exp = np.zeros((ACTION_SIZE,), dtype=np.float32)
             for mv, p in dist.items():
-                for a_idx, mv_leg in legal_map.items():
-                    if mv_leg == mv:
-                        pi_exp[a_idx] = p
-                        break
+                a_idx = move_to_idx.get(mv)
+                if a_idx is not None:
+                    pi_exp[a_idx] = p
             s = float(pi_exp.sum())
             if s <= 0:
                 pi_exp[legal_idx] = 1.0 / float(legal_idx.size)
@@ -397,7 +325,13 @@ def play_one_game_vs_expert(predict_fn,
             move_no += 1
             continue
 
-    if forced_draw:
+    if resigned_side_white is not None:
+        winner_white = not resigned_side_white
+        result = "1-0" if winner_white else "0-1"
+        z_list = [1.0 if (p == winner_white) else -1.0 for p in persp_list]
+        if not quiet:
+            print(f"[game] resignation: result={result}, plies={move_no}")
+    elif forced_draw:
         result = "1/2-1/2"
         z_list = [0.0 for _ in persp_list]
         if not quiet:
@@ -484,10 +418,15 @@ def main():
     expert_color_white = (args.opponent_color == "white")
     sf_skill = None if args.skill_level < 0 else int(args.skill_level)
 
-    # Threading: split games roughly evenly
-    n = max(1, args.games // max(1, args.threads))
+    # Threading: split games evenly, remainder to the first threads (matches selfplay.py)
+    per_thread = [args.games // args.threads] * args.threads
+    for i in range(args.games % args.threads):
+        per_thread[i] += 1
+
     threads = []
-    for i in range(args.threads):
+    for i, n in enumerate(per_thread):
+        if n <= 0:
+            continue
         th = threading.Thread(
             target=_worker_loop,
             args=(i, n, args.sims, args.temperature_moves, args.out, args.max_plies,
