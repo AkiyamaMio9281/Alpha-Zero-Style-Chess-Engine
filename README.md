@@ -88,6 +88,19 @@ python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is
 
 ---
 
+## Testing
+
+Unit tests cover the action encoding (`engine.py`) and MCTS (`mcts.py`) — the
+two places where a silent bug would otherwise just produce a model that
+quietly trains on garbage.
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+---
+
 ## Quick Start
 
 ### 1) Play against a model

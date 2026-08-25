@@ -22,13 +22,15 @@ def load_predictor(
     cfg = ModelConfig(in_planes=in_planes, channels=channels, resblocks=resblocks)
     model = load_model(checkpoint=checkpoint, cfg=cfg, device=dev)
     model.eval()
+    # autocast only pays off on CUDA; CPU fp32 stays the default path.
+    use_amp = amp and dev.type == "cuda"
 
     def _predict(feats_batch: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
         if len(feats_batch) == 0:
             return np.zeros((0, 4672), dtype=np.float32), np.zeros((0,), dtype=np.float32)
         x = np.stack(feats_batch).astype(np.float32)
         xt = torch.from_numpy(x).to(dev, non_blocking=True)
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(device_type=dev.type, enabled=use_amp):
             logits, value = model(xt)  # (B, 4672), (B,)
         return logits.detach().cpu().numpy().astype(np.float32), value.detach().cpu().numpy().astype(np.float32)
 
