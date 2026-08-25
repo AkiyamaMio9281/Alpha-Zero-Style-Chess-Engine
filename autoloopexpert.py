@@ -2,29 +2,36 @@
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 import os
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
-def run_cmd(args: List[str], cwd: Optional[str] = None) -> int:
+def run_cmd(args: List[str], cwd: Optional[str] = None) -> Tuple[int, str]:
     print("\n==> RUN:", " ".join([f'"{a}"' if " " in a else a for a in args]), flush=True)
     proc = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     assert proc.stdout is not None
+    lines: List[str] = []
     for line in proc.stdout:
         print(line, end="")
+        lines.append(line)
     proc.wait()
     print(f"<== EXIT {proc.returncode}\n", flush=True)
-    return proc.returncode
+    return proc.returncode, "".join(lines)
 
 def latest_ckpt(ckpt_dir: str) -> Optional[str]:
     p = Path(ckpt_dir)
     if not p.exists(): return None
     cands = sorted(p.glob("*.pt"), key=lambda x: x.stat().st_mtime, reverse=True)
     return str(cands[0]) if cands else None
+
+def parse_win(arena_stdout: str) -> Optional[float]:
+    m = re.search(r"Win%=?\s*([0-9]+(?:\.[0-9]+)?)\s*%", arena_stdout)
+    return float(m.group(1)) if m else None
 
 def lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
@@ -55,9 +62,10 @@ def main():
     ap.add_argument("--resume", action="store_true", help="Force resume from the start-ckpt on the first train step (default: auto)")
     ap.add_argument("--no-resume", action="store_true", help="Do not resume (override)")
     # Optional evaluation (off by default)
-    ap.add_argument("--do-arena", action="store_true", help="If set, run arena.py after each training iteration")
+    ap.add_argument("--do-arena", action="store_true", help="If set, run eval/arena.py after each iteration and gate promotion on the result")
     ap.add_argument("--arena-games", type=int, default=40)
     ap.add_argument("--arena-sims", type=int, default=400)
+    ap.add_argument("--promote-threshold", type=float, default=55.0, help="Win%% vs previous checkpoint required to promote (only used with --do-arena)")
 
     # Curriculum switches and bounds
     ap.add_argument("--curriculum", action="store_true", help="Enable easy->hard schedule for self-play parameters")
@@ -103,8 +111,6 @@ def main():
             movetime = args.movetime_end
             skill = args.skill_end
         else:
-            if it <= args.pure-iters if False else False:  # placeholder to satisfy syntax highlighting
-                pass
             # Pure imitation for the first pure-iters iterations
             if it <= args.pure_iters:
                 sims = 0
@@ -156,7 +162,7 @@ def main():
         if args.device:
             sp_cmd += ["--device", args.device]
 
-        rc = run_cmd(sp_cmd, cwd=str(proj))
+        rc, _ = run_cmd(sp_cmd, cwd=str(proj))
         if rc != 0:
             sys.exit(rc)
 
@@ -172,34 +178,46 @@ def main():
         if not args.no_resume:
             if args.resume or (cur_ckpt and Path(cur_ckpt).exists()):
                 train_cmd += ["--resume", str(cur_ckpt)]
-        rc = run_cmd(train_cmd, cwd=str(proj))
+        rc, _ = run_cmd(train_cmd, cwd=str(proj))
         if rc != 0:
             sys.exit(rc)
 
-        # 3) Update current checkpoint to latest in ckpt-dir
+        # 3) Find the checkpoint just produced by training
+        prev_ckpt = cur_ckpt
         new_ckpt = latest_ckpt(args.ckpt_dir)
-        if new_ckpt:
-            print(f"[autoloop] New checkpoint: {new_ckpt}")
-            cur_ckpt = new_ckpt
+        if not new_ckpt:
+            print("[autoloop] WARNING: no checkpoint found after training; keeping previous checkpoint.")
+            continue
+        print(f"[autoloop] New checkpoint: {new_ckpt}")
 
-        # 4) Optional evaluation
-        if args.do_arena and (proj / "arena.py").exists():
-            ckpts = sorted(Path(args.ckpt_dir).glob("*.pt"), key=lambda x: x.stat().st_mtime, reverse=True)
-            if len(ckpts) >= 2:
-                new_ckpt = str(ckpts[0])
-                old_ckpt = str(ckpts[1])
-                arena_cmd = [
-                    py, str(proj / "arena.py"),
-                    "--new", new_ckpt,
-                    "--old", old_ckpt,
-                    "--games", str(args.arena_games),
-                    "--sims", str(args.arena_sims),
-                ]
-                rc = run_cmd(arena_cmd, cwd=str(proj))
-                if rc != 0:
-                    print("[autoloop] arena.py returned non-zero (continuing).")
+        # 4) Optional evaluation: only promote the new checkpoint if it beats the
+        # previous one by --promote-threshold win%. Otherwise keep training from
+        # the last known-good checkpoint instead of silently drifting.
+        promoted = True
+        winp = None
+        if args.do_arena and prev_ckpt and Path(prev_ckpt).exists() and new_ckpt != prev_ckpt:
+            arena_cmd = [
+                py, str(proj / "eval" / "arena.py"),
+                "--new", new_ckpt,
+                "--old", prev_ckpt,
+                "--games", str(args.arena_games),
+                "--sims", str(args.arena_sims),
+                "--temperature-moves", str(args.temperature_moves),
+            ]
+            rc, out_ar = run_cmd(arena_cmd, cwd=str(proj))
+            if rc != 0:
+                print("[autoloop] arena.py returned non-zero; promoting by default (continuing).")
             else:
-                print("[autoloop] Not enough checkpoints for arena evaluation; skipping.")
+                winp = parse_win(out_ar)
+                if winp is None:
+                    print("[autoloop] WARNING: could not parse Win% from arena output; promoting by default.")
+                else:
+                    promoted = (winp >= args.promote_threshold)
+
+        cur_ckpt = new_ckpt if promoted else prev_ckpt
+        status = "PROMOTED" if promoted else "REJECTED"
+        winp_str = f" win%={winp:.1f}" if winp is not None else ""
+        print(f"[autoloop] iter {it} {status}{winp_str}; active_ckpt={cur_ckpt}")
 
     print("\n[autoloop] All iterations finished.")
     if cur_ckpt:
