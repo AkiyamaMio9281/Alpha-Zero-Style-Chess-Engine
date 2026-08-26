@@ -113,9 +113,9 @@ def train_one_epoch(
         "value_mse": mse_sum / steps,
     }
 
-def save_ckpt(model: AlphaZeroChess, optimizer: optim.Optimizer, path: str, step: int):
+def save_ckpt(model: AlphaZeroChess, optimizer: optim.Optimizer, path: str, epoch: int, step: int):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save({"model": model.state_dict(), "opt": optimizer.state_dict(), "step": step}, path)
+    torch.save({"model": model.state_dict(), "opt": optimizer.state_dict(), "epoch": epoch, "step": step}, path)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -140,6 +140,28 @@ def main():
     dataset = SelfPlayDataset(args.data, in_planes=args.in_planes)
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
+    # 恢复训练进度：epoch 计数决定学习率阶梯衰减到哪一档，optimizer 状态
+    # （SGD momentum 缓冲）也一并恢复，否则每次 --resume 学习率都会从头衰减、
+    # momentum 也会被清零重来。
+    start_epoch = 0
+    global_step = 0
+    if args.resume and os.path.exists(args.resume):
+        try:
+            ckpt = torch.load(args.resume, map_location=device)
+        except Exception as e:
+            ckpt = None
+            print(f"[trainer] could not re-read checkpoint for resume state ({e}); starting fresh optimizer/schedule.", flush=True)
+        if isinstance(ckpt, dict):
+            if "opt" in ckpt:
+                try:
+                    optimizer.load_state_dict(ckpt["opt"])
+                except Exception as e:
+                    print(f"[trainer] could not restore optimizer state ({e}); starting fresh optimizer.", flush=True)
+            start_epoch = int(ckpt.get("epoch", 0))
+            global_step = int(ckpt.get("step", 0))
+            if start_epoch or global_step:
+                print(f"[trainer] resuming from epoch={start_epoch}, step={global_step}", flush=True)
+
     # 简单阶梯衰减（参考 AlphaZero 的阶梯式）：1/10 每个 epoch
     def adjust_lr(ep_idx: int):
         base = args.lr
@@ -147,10 +169,10 @@ def main():
         for g in optimizer.param_groups:
             g["lr"] = base / decay
 
-    global_step = 0
-    for ep in range(1, args.epochs + 1):
+    end_epoch = start_epoch + args.epochs
+    for ep in range(start_epoch + 1, end_epoch + 1):
         adjust_lr(ep - 1)
-        print(f"== Epoch {ep}/{args.epochs}  lr={optimizer.param_groups[0]['lr']:.5f}", flush=True)
+        print(f"== Epoch {ep}/{end_epoch}  lr={optimizer.param_groups[0]['lr']:.5f}", flush=True)
         stats = train_one_epoch(
             model, dataset, optimizer, device,
             batch_size=args.batch_size,
@@ -158,7 +180,7 @@ def main():
         )
         global_step += args.steps_per_epoch
         ckpt_path = os.path.join(args.out, f"model_ep{ep}_step{global_step}.pt")
-        save_ckpt(model, optimizer, ckpt_path, step=global_step)
+        save_ckpt(model, optimizer, ckpt_path, epoch=ep, step=global_step)
         print(f"[ckpt] saved: {ckpt_path}   stats: {stats}", flush=True)
 
 if __name__ == "__main__":

@@ -33,6 +33,23 @@ class MCTSConfig:
     resign_threshold: Optional[float] = None   # e.g., -0.95
     virtual_loss: float = 1.0
 
+# ========= Named presets =========
+# selfplay.py, selfplay_uci.py (own-move branch) and eval/arena.py all used to
+# hardcode this same (cpuct, dirichlet_alpha, dirichlet_epsilon) triple
+# separately, which is exactly the kind of thing that drifts silently when one
+# copy gets tuned and the others don't. Centralized here instead.
+def self_play_config(sims: int) -> MCTSConfig:
+    return MCTSConfig(sims=sims, cpuct=2.0, dirichlet_alpha=0.30, dirichlet_epsilon=0.25)
+
+# selfplay_uci.py's expert-turn MCTS/expert mix: less root noise since the
+# resulting pi is blended with the expert's own distribution.
+def expert_mix_config(sims: int) -> MCTSConfig:
+    return MCTSConfig(sims=sims, cpuct=2.0, dirichlet_alpha=0.30, dirichlet_epsilon=0.03)
+
+# play_cli.py: gentler search for interactive human play (lower cpuct, low noise).
+def human_play_config(sims: int) -> MCTSConfig:
+    return MCTSConfig(sims=sims, cpuct=1.25, dirichlet_alpha=0.30, dirichlet_epsilon=0.03)
+
 # ========= Node =========
 class Node:
     __slots__ = ("P", "N", "W", "children", "is_terminal", "expanded")

@@ -15,7 +15,7 @@ from engine import (
     encode_board,
     board_outcome_to_z,
 )
-from mcts import MCTS, MCTSConfig
+from mcts import MCTS, self_play_config
 from net.batch_predict import make_batched_predictor
 
 # ===== 即时日志 =====
@@ -99,7 +99,7 @@ def play_one_game(predict_fn, sims: int, temperature_moves: int,
         # 用 MCTS 搜索
         mcts = MCTS(
             predict_fn=predict_fn,
-            mcts_cfg=MCTSConfig(sims=sims, cpuct=2.0, dirichlet_alpha=0.30, dirichlet_epsilon=0.25),
+            mcts_cfg=self_play_config(sims=sims),
             encode_cfg=encode_cfg,
             rng=rng,
         )

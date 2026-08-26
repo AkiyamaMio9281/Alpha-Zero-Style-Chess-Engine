@@ -5,7 +5,7 @@ import numpy as np
 import chess
 
 from engine import EncodeConfig, legal_moves_index_map, ACTION_SIZE, encode_board
-from mcts import MCTS, MCTSConfig
+from mcts import MCTS, human_play_config
 from predict import load_predictor
 
 def build_ai(checkpoint: str, device: str, channels: int, resblocks: int, in_planes: int):
@@ -20,7 +20,7 @@ def ai_choose_move(board: chess.Board, history: List[chess.Board], predict_fn, s
     # For human play we disable root Dirichlet noise.
     mcts = MCTS(
         predict_fn=predict_fn,
-        mcts_cfg=MCTSConfig(sims=sims, cpuct=1.25, dirichlet_alpha=0.30, dirichlet_epsilon=0.03),
+        mcts_cfg=human_play_config(sims=sims),
         encode_cfg=EncodeConfig(history=history_T),
     )
     mcts.set_root(board, history)

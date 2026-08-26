@@ -191,7 +191,7 @@ def save_shard(out_dir: str, feats_list, pi_list, z_list, result: str) -> str:
 # ------------------------------
 # One game vs expert
 # ------------------------------
-from mcts import MCTS, MCTSConfig
+from mcts import MCTS, self_play_config, expert_mix_config
 
 def play_one_game_vs_expert(predict_fn,
                             sims: int,
@@ -267,7 +267,7 @@ def play_one_game_vs_expert(predict_fn,
             if expert_alpha < 1.0 and sims > 0:
                 mcts = MCTS(
                     predict_fn=predict_fn,
-                    mcts_cfg=MCTSConfig(sims=sims, cpuct=2.0, dirichlet_alpha=0.30, dirichlet_epsilon=0.03),
+                    mcts_cfg=expert_mix_config(sims=sims),
                     encode_cfg=encode_cfg,
                     rng=rng,
                 )
@@ -299,7 +299,7 @@ def play_one_game_vs_expert(predict_fn,
             if sims > 0:
                 mcts = MCTS(
                     predict_fn=predict_fn,
-                    mcts_cfg=MCTSConfig(sims=sims, cpuct=2.0, dirichlet_alpha=0.30, dirichlet_epsilon=0.25),
+                    mcts_cfg=self_play_config(sims=sims),
                     encode_cfg=encode_cfg,
                     rng=rng,
                 )
