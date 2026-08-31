@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
+import shutil
 import subprocess
 import sys
 import os
@@ -33,6 +35,26 @@ def parse_win(arena_stdout: str) -> Optional[float]:
     m = re.search(r"Win%=?\s*([0-9]+(?:\.[0-9]+)?)\s*%", arena_stdout)
     return float(m.group(1)) if m else None
 
+def save_state(path: Path, state: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, ensure_ascii=False))
+
+def prune_old_data_dirs(data_root: str, keep: int) -> None:
+    if keep <= 0:
+        return
+    root = Path(data_root)
+    if not root.exists():
+        return
+    dirs = sorted([p for p in root.glob("it*") if p.is_dir()], key=lambda p: p.stat().st_mtime)
+    if len(dirs) <= keep:
+        return
+    for p in dirs[:-keep]:
+        try:
+            shutil.rmtree(p)
+            print(f"[autoloop] removed old data dir: {p}", flush=True)
+        except Exception as e:
+            print(f"[autoloop] failed to remove {p}: {e}", flush=True)
+
 def lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
 
@@ -44,6 +66,7 @@ def main():
     ap.add_argument("--start-ckpt", default="", help="Initial checkpoint to start from (resume). If empty, use latest in --ckpt-dir; if none found, use dummy.")
     ap.add_argument("--ckpt-dir", default="ckpt", help="Directory to save and search for checkpoints")
     ap.add_argument("--data-root", default="data/vs_expert", help="Root directory to save self-play shards")
+    ap.add_argument("--keep-iters", type=int, default=5, help="Keep only the most recent N iterations' data dirs on disk (0 = keep all)")
     ap.add_argument("--iters", type=int, default=3, help="Number of outer loops (self-play+train)")
     ap.add_argument("--device", default="", help="cuda or cpu for model inference during self-play")
     # Self-play base options (used when not using curriculum or as bounds in curriculum)
@@ -89,6 +112,8 @@ def main():
 
     py = sys.executable
     proj = Path(__file__).resolve().parent
+    state_path = proj / "autoloopexpert_state.json"
+    history: List[dict] = []
 
     # Determine initial checkpoint
     cur_ckpt = args.start_ckpt.strip()
@@ -218,6 +243,19 @@ def main():
         status = "PROMOTED" if promoted else "REJECTED"
         winp_str = f" win%={winp:.1f}" if winp is not None else ""
         print(f"[autoloop] iter {it} {status}{winp_str}; active_ckpt={cur_ckpt}")
+
+        # 5) Record + persist this iteration's history, and prune old data dirs
+        history.append({
+            "iteration": it,
+            "data_dir": str(data_dir),
+            "sims": sims, "alpha": alpha, "multipv": multipv, "movetime": movetime, "skill": skill,
+            "new_ckpt": new_ckpt,
+            "active_ckpt": cur_ckpt,
+            "promoted": promoted,
+            "win_percent": winp,
+        })
+        save_state(state_path, {"iters_done": it, "history": history})
+        prune_old_data_dirs(args.data_root, args.keep_iters)
 
     print("\n[autoloop] All iterations finished.")
     if cur_ckpt:
