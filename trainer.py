@@ -18,10 +18,12 @@ from model import AlphaZeroChess, ModelConfig, ACTION_SIZE, load_model
 class SelfPlayDataset:
     """
     从目录下的 .npz 分片中随机采样样本 (feats[C,8,8], pi[4672], z[1])。
+    递归查找子目录（如 gen1/, gen2/, ...），所以既可以指向单个分片目录，
+    也可以指向多轮自对弈数据的根目录，实现跨代的经验回放。
     支持动态 padding/裁剪特征通道到 in_planes。
     """
     def __init__(self, shards_dir: str, in_planes: int = 102, max_cached_files: int = 64):
-        self.files = sorted(glob.glob(os.path.join(shards_dir, "*.npz")))
+        self.files = sorted(glob.glob(os.path.join(shards_dir, "**", "*.npz"), recursive=True))
         if not self.files:
             raise FileNotFoundError(f"No .npz shards in {shards_dir}")
         self.in_planes = in_planes

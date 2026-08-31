@@ -192,9 +192,12 @@ def main():
             sys.exit(rc)
 
         # 2) Train on the newly generated data
+        # Train on the whole data-root (replay window across recent iterations),
+        # not just this iteration's fresh data_dir. Window size is controlled
+        # by the --keep-iters pruning below.
         train_cmd = [
             py, str(proj / "trainer.py"),
-            "--data", str(data_dir),
+            "--data", str(args.data_root),
             "--epochs", str(args.epochs),
             "--steps-per-epoch", str(args.steps_per_epoch),
             "--batch-size", str(args.batch_size),

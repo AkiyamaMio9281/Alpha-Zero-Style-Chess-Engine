@@ -108,10 +108,11 @@ def main():
             sp_cmd += ["--checkpoint", current_ckpt]
         out_sp = run_stream(sp_cmd)
 
-        # 2) 训练
+        # 2) 训练：读整个 data_root（跨代回放窗口），而不是只看这一轮的 gen_dir。
+        # 窗口大小由下面的 --keep-gens 磁盘清理控制。
         tr_cmd = [
             PY, "-u", TRAINER,
-            "--data", str(gen_dir),
+            "--data", str(data_root),
             "--epochs", "1",
             "--steps-per-epoch", str(args.steps_per_epoch),
             "--batch-size", str(args.batch_size),
