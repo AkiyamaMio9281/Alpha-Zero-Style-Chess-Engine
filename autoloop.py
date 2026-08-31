@@ -74,7 +74,6 @@ def main():
     ap.add_argument("--eval-sims", type=int, default=200)
     ap.add_argument("--promote-threshold", type=float, default=55.0)
     ap.add_argument("--device", type=str, default="")
-    ap.add_argument("--amp", action="store_true")  # 预留；selfplay 默认开启 AMP（除非 --no-amp）
     ap.add_argument("--base-ckpt", type=str, default="")
     ap.add_argument("--keep-gens", type=int, default=5)
     args = ap.parse_args()
