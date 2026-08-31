@@ -14,6 +14,15 @@ def dummy_predict(feats_batch):
     return logits, values
 
 
+def biased_predict(feats_batch):
+    """Uniform-prior, non-zero-value evaluator. A zero value would mask a
+    sign-flip bug in backup/virtual-loss bookkeeping; this won't."""
+    B = len(feats_batch)
+    logits = np.zeros((B, ACTION_SIZE), dtype=np.float32)
+    values = np.full((B,), 0.3, dtype=np.float32)
+    return logits, values
+
+
 def test_run_simulations_visits_root_exactly_sims_times():
     board = chess.Board()
     cfg = MCTSConfig(sims=30, cpuct=1.5, dirichlet_alpha=0.3, dirichlet_epsilon=0.25)
@@ -82,3 +91,68 @@ def test_set_root_marks_checkmate_as_terminal():
     assert m.root.is_terminal
     assert m.root.expanded
     assert m.root.total_visits == 0  # nothing to simulate from a terminal root
+
+
+# ----- eval_batch_size > 1: batched leaf evaluation with virtual loss -----
+
+def test_batched_simulations_visits_root_exactly_sims_times():
+    board = chess.Board()
+    cfg = MCTSConfig(sims=40, cpuct=1.5, dirichlet_alpha=0.3, dirichlet_epsilon=0.25, eval_batch_size=8)
+    m = MCTS(predict_fn=biased_predict, mcts_cfg=cfg, rng=np.random.default_rng(10))
+    m.set_root(board)
+    m.run_simulations()
+    assert m.root.total_visits == cfg.sims
+
+
+def test_batch_size_not_dividing_sims_still_visits_exactly_sims_times():
+    board = chess.Board()
+    cfg = MCTSConfig(sims=17, eval_batch_size=5)  # 17 doesn't divide evenly by 5
+    m = MCTS(predict_fn=biased_predict, mcts_cfg=cfg, rng=np.random.default_rng(11))
+    m.set_root(board)
+    m.run_simulations()
+    assert m.root.total_visits == cfg.sims
+
+
+def test_batched_select_action_returns_legal_move_with_valid_pi():
+    board = chess.Board()
+    cfg = MCTSConfig(sims=40, eval_batch_size=8)
+    m = MCTS(predict_fn=biased_predict, mcts_cfg=cfg, rng=np.random.default_rng(12))
+    m.set_root(board)
+    m.run_simulations()
+
+    move, pi = m.select_action(tau=1.0)
+    assert move in board.legal_moves
+    assert (pi >= 0).all()
+    assert pi.sum() == pytest.approx(1.0, abs=1e-4)
+
+
+def test_batched_q_values_bounded_no_virtual_loss_residue():
+    # A sign or bookkeeping bug in apply/revert virtual loss would tend to
+    # push Q outside [-1, 1] or leave a stray increment behind in N/W.
+    board = chess.Board()
+    cfg = MCTSConfig(sims=64, eval_batch_size=8)
+    m = MCTS(predict_fn=biased_predict, mcts_cfg=cfg, rng=np.random.default_rng(13))
+    m.set_root(board)
+    m.run_simulations()
+
+    assert m.root.total_visits == cfg.sims
+    for a, n in m.root.N.items():
+        assert n >= 0
+        q = m.root.q(a)
+        assert -1.0 - 1e-6 <= q <= 1.0 + 1e-6
+
+
+def test_batched_search_reaches_and_handles_terminal_leaf():
+    # Fool's mate is one ply away for Black here, so a batch is very likely
+    # to hit a finished-game leaf alongside ordinary unexpanded ones.
+    board = chess.Board()
+    for san in ["f3", "e5", "g4"]:
+        board.push_san(san)
+    cfg = MCTSConfig(sims=24, eval_batch_size=6)
+    m = MCTS(predict_fn=biased_predict, mcts_cfg=cfg, rng=np.random.default_rng(14))
+    m.set_root(board)
+    m.run_simulations()
+
+    assert m.root.total_visits == cfg.sims
+    move, _ = m.select_action(tau=0.0)
+    assert move in board.legal_moves

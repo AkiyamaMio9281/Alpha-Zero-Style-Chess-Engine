@@ -32,23 +32,31 @@ class MCTSConfig:
     dirichlet_epsilon: float = 0.25
     resign_threshold: Optional[float] = None   # e.g., -0.95
     virtual_loss: float = 1.0
+    # >1 switches run_simulations() to collecting this many tree-walks per
+    # network call (with virtual_loss discouraging repeated paths) instead of
+    # evaluating one leaf at a time. 1 (default) is the exact original
+    # single-leaf behavior, byte-for-byte unchanged.
+    eval_batch_size: int = 1
 
 # ========= Named presets =========
 # selfplay.py, selfplay_uci.py (own-move branch) and eval/arena.py all used to
 # hardcode this same (cpuct, dirichlet_alpha, dirichlet_epsilon) triple
 # separately, which is exactly the kind of thing that drifts silently when one
 # copy gets tuned and the others don't. Centralized here instead.
-def self_play_config(sims: int) -> MCTSConfig:
-    return MCTSConfig(sims=sims, cpuct=2.0, dirichlet_alpha=0.30, dirichlet_epsilon=0.25)
+def self_play_config(sims: int, eval_batch_size: int = 1) -> MCTSConfig:
+    return MCTSConfig(sims=sims, cpuct=2.0, dirichlet_alpha=0.30, dirichlet_epsilon=0.25,
+                       eval_batch_size=eval_batch_size)
 
 # selfplay_uci.py's expert-turn MCTS/expert mix: less root noise since the
 # resulting pi is blended with the expert's own distribution.
-def expert_mix_config(sims: int) -> MCTSConfig:
-    return MCTSConfig(sims=sims, cpuct=2.0, dirichlet_alpha=0.30, dirichlet_epsilon=0.03)
+def expert_mix_config(sims: int, eval_batch_size: int = 1) -> MCTSConfig:
+    return MCTSConfig(sims=sims, cpuct=2.0, dirichlet_alpha=0.30, dirichlet_epsilon=0.03,
+                       eval_batch_size=eval_batch_size)
 
 # play_cli.py: gentler search for interactive human play (lower cpuct, low noise).
-def human_play_config(sims: int) -> MCTSConfig:
-    return MCTSConfig(sims=sims, cpuct=1.25, dirichlet_alpha=0.30, dirichlet_epsilon=0.03)
+def human_play_config(sims: int, eval_batch_size: int = 1) -> MCTSConfig:
+    return MCTSConfig(sims=sims, cpuct=1.25, dirichlet_alpha=0.30, dirichlet_epsilon=0.03,
+                       eval_batch_size=eval_batch_size)
 
 # ========= Node =========
 class Node:
@@ -103,8 +111,16 @@ class MCTS:
     # ----- Core loop -----
     def run_simulations(self, sims: Optional[int] = None) -> None:
         sims = sims or self.cfg.sims
-        for _ in range(sims):
-            self._simulate_once()
+        batch_size = max(1, self.cfg.eval_batch_size)
+        if batch_size <= 1:
+            for _ in range(sims):
+                self._simulate_once()
+            return
+        remaining = sims
+        while remaining > 0:
+            n = min(batch_size, remaining)
+            self._simulate_batch(n)
+            remaining -= n
 
     def select_action(self, tau: float = 1.0) -> Tuple[chess.Move, np.ndarray]:
         """Return (selected_move, pi[4672]) from root visit counts."""
@@ -214,6 +230,95 @@ class MCTS:
                 node.children[a] = child
             node = child
 
+    # ----- Batched simulation (eval_batch_size > 1) -----
+    def _select_to_leaf(
+        self,
+    ) -> Tuple[List[Tuple[Node, int, chess.Board]], Node, chess.Board, List[chess.Board], Optional[float]]:
+        """Walk from root via PUCT -- applying virtual loss to each edge taken
+        so a sibling walk in the same batch tends to pick a different path --
+        stopping at an unexpanded node or a finished game. Does not call
+        predict_fn; callers collect several of these walks and evaluate their
+        leaves in one batch. Returns (path, leaf_node, leaf_board,
+        leaf_history, terminal_value); terminal_value is None unless the walk
+        ended on a finished game.
+        """
+        path: List[Tuple[Node, int, chess.Board]] = []
+        node = self.root
+        board = self.root_board.copy(stack=True)
+        history = list(self.root_history)
+
+        while True:
+            if board.is_game_over(claim_draw=True):
+                z = board_outcome_to_z(board, perspective_white=board.turn)
+                return path, node, board, history, z
+
+            if not node.expanded:
+                return path, node, board, history, None
+
+            a = self._select_by_puct(node)
+            self._apply_virtual_loss(node, a)
+            path.append((node, a, board.copy(stack=False)))
+            move = self._move_from_index(node, board, a)
+            board.push(move)
+            history.append(path[-1][2])
+
+            child = node.children.get(a)
+            if child is None:
+                child = Node()
+                node.children[a] = child
+            node = child
+
+    def _apply_virtual_loss(self, node: Node, a: int) -> None:
+        vl = self.cfg.virtual_loss
+        if vl <= 0:
+            return
+        node.N[a] = node.N.get(a, 0) + 1
+        node.W[a] = node.W.get(a, 0.0) - vl
+
+    def _revert_virtual_loss(self, path: List[Tuple[Node, int, chess.Board]]) -> None:
+        vl = self.cfg.virtual_loss
+        if vl <= 0:
+            return
+        for node, a, _ in path:
+            node.N[a] = node.N.get(a, 0) - 1
+            node.W[a] = node.W.get(a, 0.0) + vl
+
+    def _simulate_batch(self, n: int) -> None:
+        # Collection phase: only virtual loss is applied, nothing is expanded
+        # yet, so two walks landing on the identical still-unexpanded node
+        # both see it as unexpanded (no race -- expansion happens below, after
+        # every walk in this batch has already been collected).
+        pending: List[Tuple[List[Tuple[Node, int, chess.Board]], Node, chess.Board, List[chess.Board]]] = []
+        for _ in range(n):
+            path, node, board, history, terminal_v = self._select_to_leaf()
+            if terminal_v is not None:
+                self._revert_virtual_loss(path)
+                self._backup(path, terminal_v)
+                continue
+            pending.append((path, node, board, history))
+
+        if not pending:
+            return
+
+        feats_batch = [
+            encode_board(
+                board,
+                prev_boards=history[-(self.encode_cfg.history - 1):] if history else None,
+                cfg=self.encode_cfg,
+            )
+            for (_, _, board, history) in pending
+        ]
+        logits_batch, values_batch = self.predict_fn(feats_batch)
+        logits_batch = None if logits_batch is None else np.asarray(logits_batch)
+        values_batch = np.asarray(values_batch, dtype=np.float32).reshape(-1)
+
+        for i, (path, node, board, _history) in enumerate(pending):
+            logits_i = None if logits_batch is None else logits_batch[i].astype(np.float32)
+            v = float(values_batch[i])
+            self._finish_expand(node, board, logits_i)
+            self._revert_virtual_loss(path)
+            self._backup(path, v)
+
     def _expand_root(self) -> None:
         _ = self._expand(self.root, self.root_board.copy(stack=False), list(self.root_history))
         # Dirichlet noise at root
@@ -245,13 +350,26 @@ class MCTS:
         logits, values = self.predict_fn([feats])  # (1, A), (1,)
         logits = None if logits is None else np.asarray(logits)[0].astype(np.float32)
         v = float(np.asarray(values).reshape(-1)[0])
+        self._finish_expand(node, board, logits)
+        return v
+
+    def _finish_expand(self, node: Node, board: chess.Board, logits: Optional[np.ndarray]) -> None:
+        """Populate node.P from raw policy logits already fetched from the
+        network (single call or part of a batch) and mark the node expanded.
+        Only ever called for a non-terminal board (is_game_over already
+        checked by the caller). Safe to call twice on the same node (e.g. two
+        simulations in one batch reaching it via the identical path before
+        either gets expanded) -- the second call is a no-op.
+        """
+        if node.expanded:
+            return
 
         legal_map = legal_moves_index_map(board)
         legal_idx = list(legal_map.keys())
         if not legal_idx:
             node.is_terminal = True
             node.expanded = True
-            return 0.0
+            return
 
         pri: Dict[int, float] = {}
         if logits is None:
@@ -272,7 +390,6 @@ class MCTS:
         node.P = pri
         node.expanded = True
         node.is_terminal = False
-        return v
 
     def _select_by_puct(self, node: Node) -> int:
         total_n = node.total_visits

@@ -206,7 +206,8 @@ def play_one_game_vs_expert(predict_fn,
                             expert_multipv: int,
                             expert_movetime: int,
                             resign_cp: int = 0,
-                            resign_plies: int = 0) -> Tuple[List[np.ndarray], List[np.ndarray], List[bool], str]:
+                            resign_plies: int = 0,
+                            eval_batch_size: int = 1) -> Tuple[List[np.ndarray], List[np.ndarray], List[bool], str]:
     board = chess.Board()
     feats_list: List[np.ndarray] = []
     pi_list: List[np.ndarray] = []
@@ -267,7 +268,7 @@ def play_one_game_vs_expert(predict_fn,
             if expert_alpha < 1.0 and sims > 0:
                 mcts = MCTS(
                     predict_fn=predict_fn,
-                    mcts_cfg=expert_mix_config(sims=sims),
+                    mcts_cfg=expert_mix_config(sims=sims, eval_batch_size=eval_batch_size),
                     encode_cfg=encode_cfg,
                     rng=rng,
                 )
@@ -299,7 +300,7 @@ def play_one_game_vs_expert(predict_fn,
             if sims > 0:
                 mcts = MCTS(
                     predict_fn=predict_fn,
-                    mcts_cfg=self_play_config(sims=sims),
+                    mcts_cfg=self_play_config(sims=sims, eval_batch_size=eval_batch_size),
                     encode_cfg=encode_cfg,
                     rng=rng,
                 )
@@ -351,7 +352,8 @@ def play_one_game_vs_expert(predict_fn,
 def _worker_loop(idx: int, num_games: int, sims: int, temperature_moves: int,
                  out_dir: str, max_plies: int, predict_fn, quiet: bool, encode_cfg: EncodeConfig,
                  uci_path: str, expert_color_white: bool, expert_alpha: float, expert_multipv: int, expert_movetime: int,
-                 resign_cp: int, resign_plies: int, sf_threads: int, sf_hash: int, sf_skill: Optional[int]):
+                 resign_cp: int, resign_plies: int, sf_threads: int, sf_hash: int, sf_skill: Optional[int],
+                 eval_batch_size: int = 1):
     rng = np.random.default_rng(seed=(idx + 1) * 20250901)
     expert = UCIExpert(uci_path, threads=sf_threads, hash_mb=sf_hash, skill_level=sf_skill)  # one engine per worker
     try:
@@ -361,7 +363,7 @@ def _worker_loop(idx: int, num_games: int, sims: int, temperature_moves: int,
             feats, pi, z, result = play_one_game_vs_expert(
                 predict_fn, sims, temperature_moves, rng, max_plies, quiet, encode_cfg,
                 expert, expert_color_white, expert_alpha, expert_multipv, expert_movetime,
-                resign_cp=resign_cp, resign_plies=resign_plies
+                resign_cp=resign_cp, resign_plies=resign_plies, eval_batch_size=eval_batch_size,
             )
             p = save_shard(out_dir, feats, pi, z, result)
             if not quiet:
@@ -388,6 +390,10 @@ def main():
     # Predictor batching
     ap.add_argument("--batch-max", type=int, default=128, help=">=2 enables batch aggregator")
     ap.add_argument("--batch-wait-ms", type=int, default=5)
+    ap.add_argument("--eval-batch-size", type=int, default=1,
+                     help=">=2 evaluates that many MCTS leaves per network call within a single search "
+                          "(virtual loss keeps them from collapsing onto the same path), instead of one "
+                          "leaf at a time. 1 (default) is the original unbatched search, unchanged.")
 
     # Encoding
     ap.add_argument("--history", type=int, default=8)
@@ -432,7 +438,8 @@ def main():
             args=(i, n, args.sims, args.temperature_moves, args.out, args.max_plies,
                   predict_fn, args.quiet, encode_cfg,
                   args.uci_path, expert_color_white, float(args.expert_alpha), int(args.expert_multipv), int(args.uci_movetime),
-                  int(args.resign_cp), int(args.resign_plies), int(args.sf_threads), int(args.sf_hash), sf_skill),
+                  int(args.resign_cp), int(args.resign_plies), int(args.sf_threads), int(args.sf_hash), sf_skill,
+                  int(args.eval_batch_size)),
             daemon=True
         )
         th.start()
