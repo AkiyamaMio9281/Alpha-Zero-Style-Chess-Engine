@@ -134,12 +134,12 @@ Download a Stockfish binary for your OS and note the path to the executable.
 ### 2) Smoke test expert self-play
 #### Windows (CMD)
 ```bat
-python selfplay_uci.py --stockfish "C:\path\to\stockfish.exe" --games 2 --threads 1 --sf-threads 1 --out data\_sf_smoke --checkpoint ckpt\model_ep3_step9000.pt --movetime 50 --multipv 1 --expert-alpha 1.0 --sims 0
+python selfplay_uci.py --uci-path "C:\path\to\stockfish.exe" --games 2 --threads 1 --sf-threads 1 --out data\_sf_smoke --checkpoint ckpt\model_ep3_step9000.pt --uci-movetime 50 --expert-multipv 1 --expert-alpha 1.0 --sims 0
 ```
 
 #### macOS/Linux
 ```bash
-python selfplay_uci.py --stockfish "/path/to/stockfish" --games 2 --threads 1 --sf-threads 1 --out data/_sf_smoke --checkpoint ckpt/model_ep3_step9000.pt --movetime 50 --multipv 1 --expert-alpha 1.0 --sims 0
+python selfplay_uci.py --uci-path "/path/to/stockfish" --games 2 --threads 1 --sf-threads 1 --out data/_sf_smoke --checkpoint ckpt/model_ep3_step9000.pt --uci-movetime 50 --expert-multipv 1 --expert-alpha 1.0 --sims 0
 ```
 
 Verify shards exist:
