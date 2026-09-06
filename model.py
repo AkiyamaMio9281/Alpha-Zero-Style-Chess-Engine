@@ -37,15 +37,26 @@ class PolicyHeadFC(nn.Module):
         return logits
 
 class PolicyHeadPlanes(nn.Module):
-    """新版策略头：直接输出 73 个“动作平面”，保证与引擎的 from_sq*73+plane 顺序一致。"""
-    def __init__(self, in_channels: int):
+    """新版策略头：直接输出 73 个“动作平面”，保证与引擎的 from_sq*73+plane 顺序一致。
+
+    输出层必须是裸 conv —— 不接 BN，也不接激活。早期版本把 73 通道的输出
+    直接套了 BN+ReLU，于是所有 logits >= 0：被抑制的走法全部被钳到 0，
+    softmax 之后概率完全相同，策略头根本没法区分它们，而且 ReLU 负半区
+    的梯度是死的。训练照跑、loss 照降，只是学不出策略。
+    """
+    def __init__(self, in_channels: int, hidden: Optional[int] = None):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, 73, kernel_size=1, bias=False)
-        self.bn   = nn.BatchNorm2d(73)
+        hidden = hidden or in_channels
+        self.conv1 = nn.Conv2d(in_channels, hidden, kernel_size=3, padding=1, bias=False)
+        self.bn1   = nn.BatchNorm2d(hidden)
+        self.conv2 = nn.Conv2d(hidden, 73, kernel_size=1, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = F.relu(self.bn1(self.conv1(x)))
+        h = self.conv2(h)  # (B, 73, 8, 8)，无激活，logits 可正可负
         # (B, 73, 8, 8) -> (B, 8, 8, 73) -> (B, 8*8*73)
-        h = F.relu(self.bn(self.conv(x)))
+        # 展平后的下标即 (rank*8+file)*73 + plane = from_sq*73 + plane，
+        # 与 engine._from_plane_index 一致。
         B = h.size(0)
         logits = h.permute(0, 2, 3, 1).contiguous().view(B, 8 * 8 * 73)
         return logits
@@ -148,6 +159,15 @@ def load_model(
     # 加载权重（strict=False 以允许不同策略头之间部分加载）
     if sd is not None:
         missing, unexpected = model.load_state_dict(sd, strict=False)
+        # 修策略头输出激活之前存的 planes checkpoint 用的是 policy.conv/policy.bn，
+        # 新结构是 policy.conv1/bn1/conv2，整个策略头会 missing 掉。这必须显式说
+        # 清楚：stem/tower/value 头都照常恢复了，唯独策略头是随机初始化的，需要
+        # 重新训练——否则很容易以为在续训，却对棋力突然变差摸不着头脑。
+        if any(k.startswith("policy.") for k in missing):
+            print("[load_model] WARNING: policy head weights were NOT restored and are "
+                  "randomly initialized (this checkpoint predates the policy-head fix "
+                  "that removed the output activation). The backbone and value head "
+                  "resumed normally; the policy head has to be retrained.", flush=True)
         if missing or unexpected:
             print(f"[load_model] loaded with missing={missing} unexpected={unexpected}", flush=True)
 
