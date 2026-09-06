@@ -119,6 +119,28 @@ def save_ckpt(model: AlphaZeroChess, optimizer: optim.Optimizer, path: str, epoc
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save({"model": model.state_dict(), "opt": optimizer.state_dict(), "epoch": epoch, "step": step}, path)
 
+def _parse_milestones(spec: str) -> List[int]:
+    """Parse "20000,40000" (commas and/or whitespace) into a sorted step list."""
+    return sorted(int(tok) for tok in spec.replace(",", " ").split() if tok.strip())
+
+
+def lr_at_step(base_lr: float, global_step: int, milestones: List[int], lr_min: float) -> float:
+    """阶梯衰减，以累计 global_step 为准，而不是以“第几次 resume”为准。
+
+    旧实现是 base_lr / 10**epoch_index，而 epoch_index 直接取自断点
+    checkpoint 里的 epoch 字段，所以每次 --resume 都会把指数永久推高一截：
+    autoloopexpert.py 每轮迭代 resume 一次、跑 2 个 epoch，从 model_ep3 接着练的
+    话 lr 依次是 2e-4、2e-5（第 1 轮），2e-6、2e-7（第 2 轮），不到十几轮
+    就彻底数值死掉——而循环依旧打印正常的 loss、照常存 checkpoint。
+
+    改用 global_step 后，学习率只取决于实际训了多少步：同一段训练拆成
+    几次 resume 都得到相同的 lr。lr_min 再提供一个下界，保证无论里程碑配得
+    多激进，学习率都不会跌到 0。
+    """
+    passed = sum(1 for m in milestones if global_step >= m)
+    return max(base_lr / (10.0 ** passed), lr_min)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=str, required=True, help="dir with .npz shards")
@@ -129,6 +151,11 @@ def main():
     ap.add_argument("--resblocks", type=int, default=12)
     ap.add_argument("--in-planes", type=int, default=102)
     ap.add_argument("--lr", type=float, default=0.2)
+    ap.add_argument("--lr-milestones", type=str, default="20000,40000",
+                    help="comma-separated global_step milestones; lr drops 10x at each. "
+                         "Empty string disables decay.")
+    ap.add_argument("--lr-min", type=float, default=1e-5,
+                    help="floor for the decayed lr; it can never drop below this")
     ap.add_argument("--momentum", type=float, default=0.9)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--out", type=str, default="ckpt")
@@ -164,17 +191,21 @@ def main():
             if start_epoch or global_step:
                 print(f"[trainer] resuming from epoch={start_epoch}, step={global_step}", flush=True)
 
-    # 简单阶梯衰减（参考 AlphaZero 的阶梯式）：1/10 每个 epoch
-    def adjust_lr(ep_idx: int):
-        base = args.lr
-        decay = 10 ** (ep_idx)  # 1, 10, 100 ...
-        for g in optimizer.param_groups:
-            g["lr"] = base / decay
+    # 阶梯衰减：以 global_step 为准，而不是以累计 epoch 为准。后者会让每次
+    # --resume 都把学习率再除一个 10，在 autoloop 里几轮之后就降到 0。
+    milestones = _parse_milestones(args.lr_milestones)
+    if milestones:
+        print(f"[trainer] lr schedule: {args.lr:g} / 10^(milestones passed), "
+              f"milestones={milestones} on global_step, floor={args.lr_min:g}", flush=True)
+    else:
+        print(f"[trainer] lr schedule: constant {args.lr:g}", flush=True)
 
     end_epoch = start_epoch + args.epochs
     for ep in range(start_epoch + 1, end_epoch + 1):
-        adjust_lr(ep - 1)
-        print(f"== Epoch {ep}/{end_epoch}  lr={optimizer.param_groups[0]['lr']:.5f}", flush=True)
+        lr = lr_at_step(args.lr, global_step, milestones, args.lr_min)
+        for g in optimizer.param_groups:
+            g["lr"] = lr
+        print(f"== Epoch {ep}/{end_epoch}  global_step={global_step}  lr={lr:.6g}", flush=True)
         stats = train_one_epoch(
             model, dataset, optimizer, device,
             batch_size=args.batch_size,
