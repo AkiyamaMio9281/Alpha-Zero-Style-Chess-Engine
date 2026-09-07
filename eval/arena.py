@@ -10,7 +10,7 @@ import numpy as np
 import chess
 
 from engine import EncodeConfig
-from mcts import MCTS, self_play_config
+from mcts import MCTS, eval_config
 from predict import load_predictor
 
 def play_game(predict_white, predict_black, sims: int, temperature_moves: int, max_plies: int = 300) -> str:
@@ -25,7 +25,7 @@ def play_game(predict_white, predict_black, sims: int, temperature_moves: int, m
             return oc.result() if oc else "1/2-1/2"
 
         predict = predict_white if board.turn else predict_black
-        mcts = MCTS(predict_fn=predict, mcts_cfg=self_play_config(sims=sims), encode_cfg=encode_cfg)
+        mcts = MCTS(predict_fn=predict, mcts_cfg=eval_config(sims=sims), encode_cfg=encode_cfg)
         mcts.set_root(board, history)
         mcts.run_simulations()
         tau = 1.0 if move_no < temperature_moves else 0.0

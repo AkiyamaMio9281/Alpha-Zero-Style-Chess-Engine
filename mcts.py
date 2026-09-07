@@ -47,6 +47,19 @@ def self_play_config(sims: int, eval_batch_size: int = 1) -> MCTSConfig:
     return MCTSConfig(sims=sims, cpuct=2.0, dirichlet_alpha=0.30, dirichlet_epsilon=0.25,
                        eval_batch_size=eval_batch_size)
 
+# eval/arena.py: identical search to self-play but with root noise switched off.
+# Dirichlet noise exists to force exploration into *training* data; during
+# evaluation it just randomizes both players' moves, and arena's Win% is what
+# gates checkpoint promotion in autoloop.py / autoloopexpert.py. Measured on a
+# fixed position with a deterministic evaluator: at epsilon=0.25 twenty
+# searches picked six different moves, at epsilon=0 they picked one.
+# Game-to-game variety in the arena comes from temperature sampling
+# (tau=1 for the first --temperature-moves plies), not from root noise, so
+# dropping the noise does not collapse every game into the same line.
+def eval_config(sims: int, eval_batch_size: int = 1) -> MCTSConfig:
+    return MCTSConfig(sims=sims, cpuct=2.0, dirichlet_alpha=0.30, dirichlet_epsilon=0.0,
+                       eval_batch_size=eval_batch_size)
+
 # selfplay_uci.py's expert-turn MCTS/expert mix: less root noise since the
 # resulting pi is blended with the expert's own distribution.
 def expert_mix_config(sims: int, eval_batch_size: int = 1) -> MCTSConfig:

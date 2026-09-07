@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 from engine import ACTION_SIZE, legal_moves_index_map
-from mcts import MCTS, MCTSConfig
+from mcts import MCTS, MCTSConfig, eval_config, self_play_config
 
 
 def dummy_predict(feats_batch):
@@ -156,3 +156,50 @@ def test_batched_search_reaches_and_handles_terminal_leaf():
     assert m.root.total_visits == cfg.sims
     move, _ = m.select_action(tau=0.0)
     assert move in board.legal_moves
+
+
+# ----- config presets: evaluation must not inject root noise -----
+
+def test_eval_config_has_no_root_noise_but_self_play_still_does():
+    """arena.py's Win% is what gates checkpoint promotion in the autoloops, so
+    evaluation must not perturb either player's search. Self-play still wants
+    the noise -- that is where exploration has to enter the training data."""
+    assert eval_config(sims=100).dirichlet_epsilon == 0.0
+    assert self_play_config(sims=100).dirichlet_epsilon > 0.0
+    # otherwise identical, so the two players search the same way they train
+    e, sp = eval_config(sims=100), self_play_config(sims=100)
+    assert (e.cpuct, e.sims, e.dirichlet_alpha) == (sp.cpuct, sp.sims, sp.dirichlet_alpha)
+
+
+def test_eval_config_leaves_network_priors_untouched():
+    """dummy_predict returns uniform logits, so with no noise every legal prior
+    must come out exactly 1/n. Blending in Dirichlet noise would scatter them."""
+    board = chess.Board()
+    n_legal = len(list(board.legal_moves))
+
+    m = MCTS(predict_fn=dummy_predict, mcts_cfg=eval_config(sims=1), rng=np.random.default_rng(8))
+    m.set_root(board)
+    assert all(p == pytest.approx(1.0 / n_legal) for p in m.root.P.values())
+
+    noisy = MCTS(predict_fn=dummy_predict, mcts_cfg=self_play_config(sims=1),
+                 rng=np.random.default_rng(8))
+    noisy.set_root(board)
+    assert not all(p == pytest.approx(1.0 / n_legal) for p in noisy.root.P.values())
+
+
+def test_eval_config_search_is_reproducible():
+    """Same position, same seed, same evaluator -> same move. Under
+    self_play_config the root noise makes that fail even with a fixed seed on
+    the sampling, which is what made arena's Win% so noisy."""
+    board = chess.Board()
+
+    def pick(cfg_fn, seed):
+        m = MCTS(predict_fn=biased_predict, mcts_cfg=cfg_fn(sims=40),
+                 rng=np.random.default_rng(seed))
+        m.set_root(board)
+        m.run_simulations()
+        return m.select_action(tau=0.0)[0]
+
+    assert pick(eval_config, 3) == pick(eval_config, 3)
+    # and independent of the rng entirely, since nothing random is left
+    assert pick(eval_config, 3) == pick(eval_config, 99)
