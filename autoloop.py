@@ -122,6 +122,13 @@ def main():
             "--lr", str(args.lr),
             "--out", str(ckpt_root),
         ]
+        # 从当前活跃的 checkpoint 续训，而不是每轮从随机权重重来。缺了这一步，
+        # 每轮训出来的都是全新的随机模型，arena 自然打不过上一代，于是
+        # 永远 REJECTED、current_ckpt 永远不更新，整个循环空转。而且 trainer 的
+        # 文件名由 epoch/step 决定，不续训的话每轮都叫 model_ep1_step<spe>.pt，
+        # 会把上一代权重直接覆盖，arena 于是在拿同一个文件自己跟自己下。
+        if current_ckpt and Path(current_ckpt).exists():
+            tr_cmd += ["--resume", current_ckpt]
         out_tr = run_stream(tr_cmd)
         new_ckpt = parse_ckpt(out_tr)
         if not new_ckpt:
