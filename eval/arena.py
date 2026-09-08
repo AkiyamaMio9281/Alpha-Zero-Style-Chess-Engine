@@ -43,13 +43,21 @@ def main():
     ap.add_argument("--games", type=int, default=50)
     ap.add_argument("--sims", type=int, default=200)
     ap.add_argument("--temperature-moves", type=int, default=20)
+    ap.add_argument("--channels", type=int, default=128)
+    ap.add_argument("--resblocks", type=int, default=12)
+    ap.add_argument("--in-planes", type=int, default=102)
     ap.add_argument("--cuda-graph", action="store_true",
                     help="capture the forward pass as a CUDA graph and replay it; removes per-kernel launch overhead (CUDA only, falls back to eager)")
     args = ap.parse_args()
 
     # 加载预测器
-    p_new = load_predictor(args.new, cuda_graph=args.cuda_graph)
-    p_old = load_predictor(args.old, cuda_graph=args.cuda_graph)
+    # Model size has to be passed through: load_predictor builds the network from
+    # these before loading weights, and a mismatch is a hard size error, not a
+    # strict=False warning. Without them arena can only ever evaluate
+    # default-sized checkpoints.
+    size = dict(in_planes=args.in_planes, channels=args.channels, resblocks=args.resblocks)
+    p_new = load_predictor(args.new, cuda_graph=args.cuda_graph, **size)
+    p_old = load_predictor(args.old, cuda_graph=args.cuda_graph, **size)
 
     results = []
     for g in range(args.games):

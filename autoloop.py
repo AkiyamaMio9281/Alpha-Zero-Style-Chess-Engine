@@ -145,6 +145,11 @@ def main():
                 "--games", str(args.eval_games),
                 "--sims", str(args.eval_sims),
                 "--temperature-moves", str(args.temperature_moves),
+                # Must match what selfplay and trainer were given, or arena
+                # builds a differently-shaped network and dies loading weights.
+                "--channels", str(args.channels),
+                "--resblocks", str(args.resblocks),
+                "--in-planes", str(args.in_planes),
             ]
             out_ar = run_stream(arena_cmd)
             winp = parse_win(out_ar)
