@@ -1,6 +1,6 @@
 # selfplay_uci.py (expert-vs-self data generator with curriculum knobs)
 from __future__ import annotations
-"""
+r"""
 生成“和UCI专家（如Stockfish）对弈”的训练数据（AlphaZero风格 π、z），可选混合自家MCTS分布。
 支持：每线程独立引擎、防崩重启、Skill Level、早投降、纯模仿/均匀先验等。
 
@@ -56,11 +56,19 @@ from net.batch_predict import make_batched_predictor
 # UCI Expert wrapper (one instance per thread)
 # ------------------------------
 class UCIExpert:
-    def __init__(self, path: str, threads: int = 1, hash_mb: int = 64, skill_level: Optional[int] = None):
+    def __init__(self, path: str, threads: int = 1, hash_mb: int = 64,
+                 skill_level: Optional[int] = None, cp_scale: float = 174.0):
         self.path = path
         self.sf_threads = int(threads)
         self.sf_hash = int(hash_mb)
         self.sf_skill = None if skill_level is None else int(skill_level)
+        # Centipawn scale of the softmax that turns engine scores into soft
+        # targets. 174 = 400/ln(10), the scale of the standard centipawn to
+        # win-probability conversion, so a 174cp edge is worth e:1 in the
+        # target. The previous 1200 was so flat that a 95cp spread -- most of a
+        # pawn -- came out as a 1.08x ratio between best and worst candidate,
+        # i.e. a target carrying almost no information about which move is good.
+        self.cp_scale = float(cp_scale)
         self.engine = ce.SimpleEngine.popen_uci(path)
         self._configure()
 
@@ -127,7 +135,7 @@ class UCIExpert:
                         cand.append((mv, float(cp)))
                 if not cand:
                     return {}
-                beta = 1.0 / 1200.0  # temperature for softmax over centipawns
+                beta = 1.0 / self.cp_scale
                 xs = np.array([c for _, c in cand], dtype=np.float64)
                 p = np.exp(beta * (xs - xs.max()))
                 p = p / p.sum()
@@ -194,6 +202,29 @@ def save_shard(out_dir: str, feats_list, pi_list, z_list, result: str) -> str:
 # ------------------------------
 from mcts import MCTS, self_play_config, expert_mix_config
 
+
+def expert_pi(expert: UCIExpert, board: chess.Board, legal_map: Dict[int, chess.Move],
+              legal_idx: np.ndarray, multipv: int, movetime: int) -> Tuple[np.ndarray, bool]:
+    """The expert's move distribution as a policy target over ACTION_SIZE.
+
+    Returns (pi, from_expert). ``from_expert`` is False when the engine gave
+    nothing back and the uniform fallback was used -- worth counting, because a
+    uniform target is an inverted training signal, not a weak one.
+    """
+    dist = expert.distribution(board, multipv=multipv, movetime_ms=movetime)
+    move_to_idx = {mv: a_idx for a_idx, mv in legal_map.items()}
+    pi = np.zeros((ACTION_SIZE,), dtype=np.float32)
+    for mv, p in dist.items():
+        a_idx = move_to_idx.get(mv)
+        if a_idx is not None:
+            pi[a_idx] = p
+    total = float(pi.sum())
+    if total <= 0:
+        pi[legal_idx] = 1.0 / float(legal_idx.size)
+        return pi, False
+    pi /= total
+    return pi, True
+
 def play_one_game_vs_expert(predict_fn,
                             sims: int,
                             temperature_moves: int,
@@ -252,18 +283,8 @@ def play_one_game_vs_expert(predict_fn,
 
         if side_is_expert:
             # Expert distribution
-            dist = expert.distribution(board, multipv=expert_multipv, movetime_ms=expert_movetime)
-            move_to_idx = {mv_leg: a_idx for a_idx, mv_leg in legal_map.items()}
-            pi_exp = np.zeros((ACTION_SIZE,), dtype=np.float32)
-            for mv, p in dist.items():
-                a_idx = move_to_idx.get(mv)
-                if a_idx is not None:
-                    pi_exp[a_idx] = p
-            s = float(pi_exp.sum())
-            if s <= 0:
-                pi_exp[legal_idx] = 1.0 / float(legal_idx.size)
-            else:
-                pi_exp /= s
+            pi_exp, _ = expert_pi(expert, board, legal_map, legal_idx,
+                                  expert_multipv, expert_movetime)
 
             pi_mcts = np.zeros((ACTION_SIZE,), dtype=np.float32)
             if expert_alpha < 1.0 and sims > 0:
@@ -310,11 +331,21 @@ def play_one_game_vs_expert(predict_fn,
                 tau = 1.0 if move_no < temperature_moves else 0.0
                 move, pi = mcts.select_action(tau=tau)
             else:
-                # Uniform over legal moves
-                pi = np.zeros((ACTION_SIZE,), dtype=np.float32)
-                pi[legal_idx] = 1.0 / float(legal_idx.size)
-                # Sample a move uniformly
-                a = int(np.random.choice(legal_idx))
+                # Behaviour cloning on our own turns too. Keep playing a random
+                # move so the visited states stay diverse -- that diversity is
+                # the point of not letting the expert drive both sides -- but
+                # label the position with the expert's distribution.
+                #
+                # This used to record a uniform pi here, which is not a weak
+                # imitation target but an inverted one: measured on a
+                # pure-imitation run, 46% of samples were uniform over every
+                # legal move, training the network towards "all moves are
+                # equally good" on nearly half the data.
+                pi, _ = expert_pi(expert, board, legal_map, legal_idx,
+                                  expert_multipv, expert_movetime)
+                # rng, not np.random: the worker's seed is what makes a run
+                # reproducible, and the global RNG is shared across threads.
+                a = int(rng.choice(legal_idx))
                 move = legal_map[a]
 
             feats_list.append(feats)
@@ -354,9 +385,10 @@ def _worker_loop(idx: int, num_games: int, sims: int, temperature_moves: int,
                  out_dir: str, max_plies: int, predict_fn, quiet: bool, encode_cfg: EncodeConfig,
                  uci_path: str, expert_color_white: bool, expert_alpha: float, expert_multipv: int, expert_movetime: int,
                  resign_cp: int, resign_plies: int, sf_threads: int, sf_hash: int, sf_skill: Optional[int],
-                 eval_batch_size: int = 1):
+                 eval_batch_size: int = 1, cp_scale: float = 174.0):
     rng = np.random.default_rng(seed=(idx + 1) * 20250901)
-    expert = UCIExpert(uci_path, threads=sf_threads, hash_mb=sf_hash, skill_level=sf_skill)  # one engine per worker
+    expert = UCIExpert(uci_path, threads=sf_threads, hash_mb=sf_hash, skill_level=sf_skill,
+                       cp_scale=cp_scale)  # one engine per worker
     try:
         for g in range(num_games):
             if not quiet:
@@ -407,6 +439,10 @@ def main():
     ap.add_argument("--uci-movetime", type=int, default=200, help="expert think time per move in ms")
     ap.add_argument("--expert-multipv", type=int, default=6, help="use MultiPV candidates to build a soft target")
     ap.add_argument("--expert-alpha", type=float, default=0.7, help="mixing weight: pi = (1-a)*pi_mcts + a*pi_expert on expert turns")
+    ap.add_argument("--expert-cp-scale", type=float, default=174.0,
+                    help="centipawn scale of the softmax over engine scores. 174 = 400/ln(10), "
+                         "matching the standard centipawn-to-win-probability conversion. Larger "
+                         "flattens the soft targets, smaller sharpens them.")
     ap.add_argument("--sf-threads", type=int, default=1, help="Stockfish Threads per worker")
     ap.add_argument("--sf-hash", type=int, default=64, help="Stockfish Hash (MB) per worker")
     ap.add_argument("--skill-level", type=int, default=-1, help="Stockfish Skill Level (0..20). Negative = don't set.")
@@ -442,7 +478,7 @@ def main():
                   predict_fn, args.quiet, encode_cfg,
                   args.uci_path, expert_color_white, float(args.expert_alpha), int(args.expert_multipv), int(args.uci_movetime),
                   int(args.resign_cp), int(args.resign_plies), int(args.sf_threads), int(args.sf_hash), sf_skill,
-                  int(args.eval_batch_size)),
+                  int(args.eval_batch_size), float(args.expert_cp_scale)),
             daemon=True
         )
         th.start()

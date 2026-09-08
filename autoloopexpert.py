@@ -103,6 +103,8 @@ def main():
     ap.add_argument("--movetime-end", type=int, default=300)
     ap.add_argument("--skill-start", type=int, default=5)
     ap.add_argument("--skill-end", type=int, default=20)
+    ap.add_argument("--expert-cp-scale", type=float, default=174.0,
+                    help="centipawn scale of the expert softmax (see selfplay_uci.py)")
     ap.add_argument("--sf-threads", type=int, default=1)
     ap.add_argument("--sf-hash", type=int, default=64)
     ap.add_argument("--resign-cp", type=int, default=0)
@@ -175,6 +177,7 @@ def main():
             "--uci-movetime", str(movetime),
             "--expert-multipv", str(multipv),
             "--expert-alpha", str(alpha),
+            "--expert-cp-scale", str(args.expert_cp_scale),
             "--history", str(args.history),
             "--batch-max", str(args.batch_max),
             "--batch-wait-ms", str(args.batch_wait_ms),
