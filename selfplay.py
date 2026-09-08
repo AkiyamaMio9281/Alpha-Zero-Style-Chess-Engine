@@ -161,6 +161,7 @@ def _build_predict_fn(args) -> Callable[[List[np.ndarray]], Tuple[np.ndarray, np
                 in_planes=102, channels=args.channels, resblocks=args.resblocks,
                 amp=(not args.no_amp),
                 device=(args.device if args.device else None),
+                cuda_graph=args.cuda_graph,
             )
             # 批量聚合开关
             if args.batch_max > 1:
@@ -201,6 +202,8 @@ def main():
     ap.add_argument("--channels", type=int, default=128)
     ap.add_argument("--resblocks", type=int, default=12)
     ap.add_argument("--no-amp", action="store_true")
+    ap.add_argument("--cuda-graph", action="store_true",
+                    help="capture the forward pass as a CUDA graph and replay it; removes per-kernel launch overhead (CUDA only, falls back to eager)")
     ap.add_argument("--device", type=str, default="", help="e.g., cuda or cpu")
     # 批量推理参数
     ap.add_argument("--batch-max", type=int, default=128, help=">=2 启用批量聚合；1 表示关闭")

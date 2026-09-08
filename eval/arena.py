@@ -43,11 +43,13 @@ def main():
     ap.add_argument("--games", type=int, default=50)
     ap.add_argument("--sims", type=int, default=200)
     ap.add_argument("--temperature-moves", type=int, default=20)
+    ap.add_argument("--cuda-graph", action="store_true",
+                    help="capture the forward pass as a CUDA graph and replay it; removes per-kernel launch overhead (CUDA only, falls back to eager)")
     args = ap.parse_args()
 
     # 加载预测器
-    p_new = load_predictor(args.new)
-    p_old = load_predictor(args.old)
+    p_new = load_predictor(args.new, cuda_graph=args.cuda_graph)
+    p_old = load_predictor(args.old, cuda_graph=args.cuda_graph)
 
     results = []
     for g in range(args.games):
