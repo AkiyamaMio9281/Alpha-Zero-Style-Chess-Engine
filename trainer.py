@@ -44,24 +44,43 @@ class SelfPlayDataset:
             self._cache.popitem(last=False)
         return self._cache[path]
 
-    def sample(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def sample(self, batch_size: int, files_per_batch: int = 16) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Draw a batch, reading from *files_per_batch* shards rather than one
+        shard per sample.
+
+        Picking a shard independently for every sample means a batch of 256
+        touches 256 shards. With more shards than fit in the cache that misses
+        almost every time, and each miss decompresses a whole shard to keep one
+        position out of it. Measured on 200 shards with the 64-shard cache:
+        32% hit rate, 174 misses per batch, 525 ms to build one batch against
+        27 ms to train on it -- the GPU sat idle 94.8% of the time and a
+        2000-step epoch took 17 minutes instead of one.
+
+        Reading several samples per shard cuts the lookups by the same factor.
+        The cost is that a batch is drawn from fewer games, so its samples are
+        more correlated; 16 shards per batch keeps that mild while removing
+        almost all of the decompression.
+        """
         xs, ps, zs = [], [], []
-        for _ in range(batch_size):
+        groups = max(1, min(files_per_batch, batch_size, len(self.files)))
+        base, extra = divmod(batch_size, groups)
+        for g in range(groups):
             f = random.choice(self.files)
             arr = self._load_file(f)
             n = arr["feats"].shape[0]
-            i = random.randrange(n)
-            x = arr["feats"][i]  # (C?,8,8)
-            # 调整到 in_planes：不足则 0-pad，超出则裁剪
-            C = x.shape[0]
-            if C < self.in_planes:
-                pad = np.zeros((self.in_planes - C, 8, 8), dtype=x.dtype)
-                x = np.concatenate([x, pad], axis=0)
-            elif C > self.in_planes:
-                x = x[:self.in_planes]
-            xs.append(x.astype(np.float32))
-            ps.append(arr["pi"][i].astype(np.float32))     # (4672,)
-            zs.append(np.float32(arr["z"][i]))             # ()
+            for _ in range(base + (1 if g < extra else 0)):
+                i = random.randrange(n)
+                x = arr["feats"][i]  # (C?,8,8)
+                # 调整到 in_planes：不足则 0-pad，超出则裁剪
+                C = x.shape[0]
+                if C < self.in_planes:
+                    pad = np.zeros((self.in_planes - C, 8, 8), dtype=x.dtype)
+                    x = np.concatenate([x, pad], axis=0)
+                elif C > self.in_planes:
+                    x = x[:self.in_planes]
+                xs.append(x.astype(np.float32))
+                ps.append(arr["pi"][i].astype(np.float32))     # (4672,)
+                zs.append(np.float32(arr["z"][i]))             # ()
         return np.stack(xs), np.stack(ps), np.asarray(zs)
 
 # ==== 训练 ====
@@ -74,6 +93,7 @@ def train_one_epoch(
     steps: int,
     value_weight: float = 1.0,
     weight_decay: float = 1e-4,
+    files_per_batch: int = 16,
 ) -> Dict[str, float]:
     model.train()
     ce = nn.KLDivLoss(reduction="batchmean")  # 使用 KLDiv 与 soft targets（等价于 CE with soft labels）
@@ -85,7 +105,7 @@ def train_one_epoch(
     mse_sum = 0.0
 
     for step in range(steps):
-        x_np, pi_np, z_np = dataset.sample(batch_size)
+        x_np, pi_np, z_np = dataset.sample(batch_size, files_per_batch=files_per_batch)
         x = torch.from_numpy(x_np).to(device)
         pi = torch.from_numpy(pi_np).to(device)
         z = torch.from_numpy(z_np).to(device)
@@ -147,6 +167,10 @@ def main():
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--steps-per-epoch", type=int, default=1000)
     ap.add_argument("--batch-size", type=int, default=256)
+    ap.add_argument("--files-per-batch", type=int, default=16,
+                    help="how many shards one batch is drawn from. Lower reads less from disk "
+                         "but correlates the batch; equal to --batch-size restores the old "
+                         "one-shard-per-sample behaviour.")
     ap.add_argument("--channels", type=int, default=128)
     ap.add_argument("--resblocks", type=int, default=12)
     ap.add_argument("--in-planes", type=int, default=102)
@@ -210,6 +234,7 @@ def main():
             model, dataset, optimizer, device,
             batch_size=args.batch_size,
             steps=args.steps_per_epoch,
+            files_per_batch=args.files_per_batch,
         )
         global_step += args.steps_per_epoch
         ckpt_path = os.path.join(args.out, f"model_ep{ep}_step{global_step}.pt")
