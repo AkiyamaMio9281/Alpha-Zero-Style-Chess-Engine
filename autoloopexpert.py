@@ -68,6 +68,12 @@ def main():
     ap.add_argument("--data-root", default="data/vs_expert", help="Root directory to save self-play shards")
     ap.add_argument("--keep-iters", type=int, default=5, help="Keep only the most recent N iterations' data dirs on disk (0 = keep all)")
     ap.add_argument("--iters", type=int, default=3, help="Number of outer loops (self-play+train)")
+    ap.add_argument("--start-iter", type=int, default=1,
+                    help="Resume the curriculum at this iteration instead of 1. A long run that "
+                         "dies partway otherwise has to redo every completed iteration, and the "
+                         "curriculum position -- sims, alpha, multipv, movetime, skill -- is "
+                         "derived from the iteration number, so restarting at 1 also silently "
+                         "restarts the schedule.")
     ap.add_argument("--device", default="", help="cuda or cpu for model inference during self-play")
     # Self-play base options (used when not using curriculum or as bounds in curriculum)
     ap.add_argument("--games", type=int, default=120)
@@ -135,7 +141,10 @@ def main():
         print(f"[autoloop] WARNING: start-ckpt not found: {cur_ckpt}. Will fallback to dummy for selfplay.")
         cur_ckpt = ""
 
-    for it in range(1, args.iters + 1):
+    if args.start_iter > 1:
+        print(f"[autoloop] resuming at iteration {args.start_iter} "
+              f"(curriculum picks up where it left off, not at the start)", flush=True)
+    for it in range(args.start_iter, args.iters + 1):
         print(f"\n====================== ITERATION {it}/{args.iters} ======================\n")
 
         # Decide parameters for this iteration

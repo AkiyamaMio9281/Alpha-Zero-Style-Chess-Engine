@@ -209,3 +209,36 @@ def test_multipv_default_gives_soft_targets(tmp_path, monkeypatch):
 
     multipv = int(_arg(_cmds(calls, "selfplay_uci.py")[0], "--expert-multipv"))
     assert multipv > 1, f"default multipv {multipv} yields one-hot targets"
+
+
+def test_start_iter_resumes_the_curriculum_where_it_stopped(tmp_path, monkeypatch):
+    """The curriculum position is derived from the iteration number, so a run
+    that dies at iteration 4 and restarts at 1 does not just redo the work --
+    it redoes it at the wrong difficulty."""
+    calls = []
+
+    def run_cmd(args, cwd=None):
+        args = [str(a) for a in args]
+        calls.append(args)
+        if "trainer.py" in " ".join(args):
+            out = Path(_arg(args, "--out"))
+            out.mkdir(parents=True, exist_ok=True)
+            (out / f"model_{len(calls)}.pt").touch()
+        return 0, ""
+
+    monkeypatch.setattr(autoloopexpert, "run_cmd", run_cmd)
+    monkeypatch.setattr(autoloopexpert, "save_state", lambda *a, **k: None)
+    monkeypatch.setattr(sys, "argv", [
+        "autoloopexpert.py", "--stockfish", "sf.exe",
+        "--ckpt-dir", str(tmp_path / "ckpt"), "--data-root", str(tmp_path / "data"),
+        "--iters", "10", "--start-iter", "8", "--games", "2", "--steps-per-epoch", "10",
+        "--curriculum", "--pure-iters", "3",
+    ])
+    autoloopexpert.main()
+
+    sp = _cmds(calls, "selfplay_uci.py")
+    assert len(sp) == 3, f"should run iterations 8, 9, 10 -- got {len(sp)}"
+    # iteration 8 is well past --pure-iters 3, so the schedule must have advanced
+    assert int(_arg(sp[0], "--sims")) > 0, "resumed at the start of the curriculum, not at iteration 8"
+    # and the data dir is stamped with the real iteration number
+    assert "it8_" in _arg(sp[0], "--out")
