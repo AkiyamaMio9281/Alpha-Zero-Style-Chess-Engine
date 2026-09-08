@@ -150,3 +150,62 @@ def test_expert_loop_forwards_cuda_graph_to_arena(expert_calls):
     arenas = _cmds(expert_calls, "arena.py")
     assert arenas, "no arena run -- --do-arena should have triggered one"
     assert all("--cuda-graph" in cmd for cmd in arenas)
+
+
+def test_pure_imitation_uses_multipv_start_not_a_hardcoded_one(tmp_path, monkeypatch):
+    """A single candidate leaves the softmax over engine scores nothing to
+    soften, so every target comes out one-hot and --expert-cp-scale does
+    nothing. Measured on a live run before this was fixed: 100% of rows
+    one-hot, i.e. behaviour cloning on hard labels rather than distillation."""
+    calls = []
+
+    def run_cmd(args, cwd=None):
+        args = [str(a) for a in args]
+        calls.append(args)
+        if "trainer.py" in " ".join(args):
+            out = Path(_arg(args, "--out"))
+            out.mkdir(parents=True, exist_ok=True)
+            (out / f"model_{len(calls)}.pt").touch()
+        return 0, ""
+
+    monkeypatch.setattr(autoloopexpert, "run_cmd", run_cmd)
+    monkeypatch.setattr(autoloopexpert, "save_state", lambda *a, **k: None)
+    monkeypatch.setattr(sys, "argv", [
+        "autoloopexpert.py", "--stockfish", "sf.exe",
+        "--ckpt-dir", str(tmp_path / "ckpt"), "--data-root", str(tmp_path / "data"),
+        "--iters", "2", "--games", "2", "--steps-per-epoch", "10",
+        "--curriculum", "--pure-iters", "2", "--multipv-start", "5",
+    ])
+    autoloopexpert.main()
+
+    for cmd in _cmds(calls, "selfplay_uci.py"):        # both are pure-imitation
+        assert _arg(cmd, "--expert-multipv") == "5"
+
+
+def test_multipv_default_gives_soft_targets(tmp_path, monkeypatch):
+    """The default has to be above 1 on its own. The failure is silent -- one-hot
+    targets train perfectly well, they just carry less information than the soft
+    ones the engine could have provided."""
+    calls = []
+
+    def run_cmd(args, cwd=None):
+        args = [str(a) for a in args]
+        calls.append(args)
+        if "trainer.py" in " ".join(args):
+            out = Path(_arg(args, "--out"))
+            out.mkdir(parents=True, exist_ok=True)
+            (out / f"model_{len(calls)}.pt").touch()
+        return 0, ""
+
+    monkeypatch.setattr(autoloopexpert, "run_cmd", run_cmd)
+    monkeypatch.setattr(autoloopexpert, "save_state", lambda *a, **k: None)
+    monkeypatch.setattr(sys, "argv", [
+        "autoloopexpert.py", "--stockfish", "sf.exe",
+        "--ckpt-dir", str(tmp_path / "ckpt"), "--data-root", str(tmp_path / "data"),
+        "--iters", "1", "--games", "2", "--steps-per-epoch", "10",
+        "--curriculum", "--pure-iters", "1",          # no --multipv-start
+    ])
+    autoloopexpert.main()
+
+    multipv = int(_arg(_cmds(calls, "selfplay_uci.py")[0], "--expert-multipv"))
+    assert multipv > 1, f"default multipv {multipv} yields one-hot targets"

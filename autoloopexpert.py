@@ -101,7 +101,11 @@ def main():
     ap.add_argument("--sims-end", type=int, default=400)
     ap.add_argument("--alpha-start", type=float, default=1.0)
     ap.add_argument("--alpha-end", type=float, default=0.5)
-    ap.add_argument("--multipv-start", type=int, default=1)
+    # 4, not 1: multipv is not an easy-to-hard axis like sims or skill, it is
+    # how much of the engine's preference ordering survives into the target.
+    # At a fixed movetime a higher multipv buys breadth with depth, and for a
+    # distillation target that trade is worth making from the start.
+    ap.add_argument("--multipv-start", type=int, default=4)
     ap.add_argument("--multipv-end", type=int, default=6)
     ap.add_argument("--movetime-start", type=int, default=100)
     ap.add_argument("--movetime-end", type=int, default=300)
@@ -146,7 +150,14 @@ def main():
             if it <= args.pure_iters:
                 sims = 0
                 alpha = 1.0
-                multipv = 1
+                # Not hardcoded to 1. With a single candidate the softmax over
+                # engine scores has nothing to soften, so every target comes
+                # out one-hot: measured on a live run, 100% of rows were
+                # one-hot and --expert-cp-scale had no effect at all. That
+                # makes the bootstrap phase plain behaviour cloning on hard
+                # labels rather than distillation from soft ones, which is the
+                # whole point of taking targets from an engine.
+                multipv = args.multipv_start
                 movetime = args.movetime_start
                 skill = args.skill_start
             else:
