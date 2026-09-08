@@ -4,6 +4,7 @@ import pytest
 
 from engine import (
     ACTION_SIZE,
+    PIECE_ORDER,
     EncodeConfig,
     board_outcome_to_z,
     encode_board,
@@ -118,3 +119,69 @@ def test_result_string_to_z():
     assert result_string_to_z("1/2-1/2", perspective_white=True) == 0.0
     with pytest.raises(ValueError):
         result_string_to_z("bogus", perspective_white=True)
+
+
+# ----- history-frame perspective -----
+
+# Black is missing the g8 knight, so the two sides have different knight counts.
+# Material has to be asymmetric for this class of bug to be visible at all: in a
+# symmetric position, mirroring the board exactly compensates for swapping
+# own/opp, and both the correct and the broken encoding produce the same planes.
+ASYMMETRIC_FEN = "rnbqkb1r/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+KNIGHT_PLANE = PIECE_ORDER.index(chess.KNIGHT)
+
+
+def _frame_knight_counts(feats, n_frames):
+    """(own, opp) knight counts for each of the first n_frames history frames.
+    Frame k occupies channels [12k, 12k+12): first 6 own, last 6 opponent."""
+    return [(int(feats[12 * k + KNIGHT_PLANE].sum()),
+             int(feats[12 * k + 6 + KNIGHT_PLANE].sum()))
+            for k in range(n_frames)]
+
+
+@pytest.mark.parametrize("moves, mover", [
+    (["e4", "e5", "d4", "d5", "Nf3"], chess.BLACK),
+    (["e4", "e5", "d4", "d5"], chess.WHITE),
+])
+def test_history_frames_all_use_the_current_players_perspective(moves, mover):
+    """Every history frame must be encoded from the perspective of the player to
+    move on the *current* board. Encoding each frame from its own side-to-move
+    -- as this did originally -- makes "own" alternate between the two players
+    down the history stack, so the 96 history channels carry an alternating
+    transform instead of a temporal signal."""
+    board = chess.Board(ASYMMETRIC_FEN)
+    history = []
+    for san in moves:
+        prev = board.copy(stack=False)
+        board.push_san(san)
+        history.append(prev)
+    assert board.turn == mover
+
+    feats = encode_board(board, prev_boards=history, cfg=EncodeConfig(history=8))
+
+    own_expected = len(board.pieces(chess.KNIGHT, mover))
+    opp_expected = len(board.pieces(chess.KNIGHT, not mover))
+    assert own_expected != opp_expected, "test position must be asymmetric to be meaningful"
+
+    counts = _frame_knight_counts(feats, len(moves))
+    assert counts == [(own_expected, opp_expected)] * len(moves), (
+        f"own/opp knight counts alternate across frames: {counts}"
+    )
+
+
+def test_encoding_is_invariant_under_color_mirroring():
+    """Swapping both colours and flipping the board must leave the features
+    untouched, since everything is encoded relative to the side to move. This is
+    a general property of the encoding rather than a check on frame
+    perspective -- the per-frame version of the bug above satisfies it too."""
+    board = chess.Board()
+    history = []
+    for san in ["e4", "c5", "Nf3", "d6", "d4", "cxd4"]:
+        prev = board.copy(stack=False)
+        board.push_san(san)
+        history.append(prev)
+
+    cfg = EncodeConfig(history=8)
+    direct = encode_board(board, prev_boards=history, cfg=cfg)
+    mirrored = encode_board(board.mirror(), prev_boards=[h.mirror() for h in history], cfg=cfg)
+    assert np.array_equal(direct, mirrored)

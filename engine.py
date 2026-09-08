@@ -194,10 +194,20 @@ def _aux_planes(b: chess.Board, cfg: EncodeConfig, perspective_white: bool) -> n
     planes.append(np.full((8, 8), hm, dtype=np.float32))
     return np.stack(planes, axis=0)
 
-def _encode_frame(b: chess.Board) -> np.ndarray:
-    stm = b.turn
-    own = _planes_for_color(b, stm, stm)
-    opp = _planes_for_color(b, not stm, stm)
+def _encode_frame(b: chess.Board, perspective_white: bool) -> np.ndarray:
+    """Encode one frame from a FIXED perspective (the player to move on the
+    *current* board), not from that frame's own side-to-move.
+
+    Using each frame's own turn -- as this did originally -- makes both the
+    board orientation and the own/opp plane assignment flip on every ply, so
+    across T=8 history frames "own" alternates between the two players and the
+    board flips upside down each step. The network then has to undo an
+    alternating transform before any temporal signal is readable, which is not
+    what AlphaZero does: there P1 is the current player throughout the history
+    stack and the board is oriented to that player for every frame.
+    """
+    own = _planes_for_color(b, perspective_white, perspective_white)
+    opp = _planes_for_color(b, not perspective_white, perspective_white)
     return np.concatenate([own, opp], axis=0)  # (12,8,8)
 
 def encode_board(
@@ -231,7 +241,9 @@ def encode_board(
             pad = [frames[-1]] * (T - len(frames))
             frames = frames + pad
 
-    plane_list = [_encode_frame(fb) for fb in frames]  # T × (12,8,8)
+    # 所有历史帧都用当前行棋方的视角，而不是各帧自己的。
+    persp = board.turn
+    plane_list = [_encode_frame(fb, persp) for fb in frames]  # T × (12,8,8)
     planes = np.concatenate(plane_list, axis=0)        # (T*12,8,8)
     aux = _aux_planes(board, cfg, board.turn)          # (P,8,8)
     feats = np.concatenate([planes, aux], axis=0).astype(np.float32)
