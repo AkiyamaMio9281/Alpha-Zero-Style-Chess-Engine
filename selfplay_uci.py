@@ -197,6 +197,38 @@ def save_shard(out_dir: str, feats_list, pi_list, z_list, result: str) -> str:
     np.savez_compressed(path, feats=arr_feats, pi=arr_pi, z=arr_z, result=result)
     return path
 
+
+def _pick_imitation_move(pi: np.ndarray, legal_map: Dict[int, chess.Move],
+                         legal_idx: np.ndarray, policy: str,
+                         rng: np.random.Generator) -> chess.Move:
+    """Choose our move during the imitation phase (sims=0).
+
+    Playing uniformly at random looks like it buys state diversity, but against
+    a real engine it just loses immediately: measured against Stockfish at skill
+    15, four games ran 6, 16, 32 and 42 plies and all four were losses, so the
+    data was almost entirely openings and already-lost positions with z = -1 on
+    every one of our samples. The network never saw a middlegame.
+
+    Sampling from the expert's own distribution -- which has already been
+    computed for the label, so it is free -- keeps games a realistic length and
+    still varies the line, with --expert-cp-scale controlling how much. Use rng,
+    not np.random: the worker's seed is what makes a run reproducible, and the
+    global RNG is shared across threads.
+    """
+    if policy == "random":
+        return legal_map[int(rng.choice(legal_idx))]
+
+    probs = pi[legal_idx].astype(np.float64)
+    total = probs.sum()
+    if total <= 0:                      # expert gave nothing; fall back
+        return legal_map[int(rng.choice(legal_idx))]
+    probs /= total
+
+    if policy == "expert-best":
+        return legal_map[int(legal_idx[int(np.argmax(probs))])]
+    return legal_map[int(rng.choice(legal_idx, p=probs))]
+
+
 # ------------------------------
 # One game vs expert
 # ------------------------------
@@ -239,7 +271,8 @@ def play_one_game_vs_expert(predict_fn,
                             expert_movetime: int,
                             resign_cp: int = 0,
                             resign_plies: int = 0,
-                            eval_batch_size: int = 1) -> Tuple[List[np.ndarray], List[np.ndarray], List[bool], str]:
+                            eval_batch_size: int = 1,
+                            imitation_move: str = "expert-sample") -> Tuple[List[np.ndarray], List[np.ndarray], List[bool], str]:
     board = chess.Board()
     feats_list: List[np.ndarray] = []
     pi_list: List[np.ndarray] = []
@@ -331,22 +364,15 @@ def play_one_game_vs_expert(predict_fn,
                 tau = 1.0 if move_no < temperature_moves else 0.0
                 move, pi = mcts.select_action(tau=tau)
             else:
-                # Behaviour cloning on our own turns too. Keep playing a random
-                # move so the visited states stay diverse -- that diversity is
-                # the point of not letting the expert drive both sides -- but
-                # label the position with the expert's distribution.
-                #
-                # This used to record a uniform pi here, which is not a weak
-                # imitation target but an inverted one: measured on a
-                # pure-imitation run, 46% of samples were uniform over every
-                # legal move, training the network towards "all moves are
-                # equally good" on nearly half the data.
+                # Behaviour cloning on our own turns too: label the position
+                # with the expert's distribution rather than a uniform one.
+                # Recording uniform here is not a weak imitation target but an
+                # inverted one -- measured on a pure-imitation run, 46% of
+                # samples were uniform over every legal move, training the
+                # network towards "all moves are equally good".
                 pi, _ = expert_pi(expert, board, legal_map, legal_idx,
                                   expert_multipv, expert_movetime)
-                # rng, not np.random: the worker's seed is what makes a run
-                # reproducible, and the global RNG is shared across threads.
-                a = int(rng.choice(legal_idx))
-                move = legal_map[a]
+                move = _pick_imitation_move(pi, legal_map, legal_idx, imitation_move, rng)
 
             feats_list.append(feats)
             pi_list.append(pi.astype(np.float32))
@@ -385,7 +411,8 @@ def _worker_loop(idx: int, num_games: int, sims: int, temperature_moves: int,
                  out_dir: str, max_plies: int, predict_fn, quiet: bool, encode_cfg: EncodeConfig,
                  uci_path: str, expert_color_white: bool, expert_alpha: float, expert_multipv: int, expert_movetime: int,
                  resign_cp: int, resign_plies: int, sf_threads: int, sf_hash: int, sf_skill: Optional[int],
-                 eval_batch_size: int = 1, cp_scale: float = 174.0):
+                 eval_batch_size: int = 1, cp_scale: float = 174.0,
+                 imitation_move: str = "expert-sample"):
     rng = np.random.default_rng(seed=(idx + 1) * 20250901)
     expert = UCIExpert(uci_path, threads=sf_threads, hash_mb=sf_hash, skill_level=sf_skill,
                        cp_scale=cp_scale)  # one engine per worker
@@ -397,6 +424,7 @@ def _worker_loop(idx: int, num_games: int, sims: int, temperature_moves: int,
                 predict_fn, sims, temperature_moves, rng, max_plies, quiet, encode_cfg,
                 expert, expert_color_white, expert_alpha, expert_multipv, expert_movetime,
                 resign_cp=resign_cp, resign_plies=resign_plies, eval_batch_size=eval_batch_size,
+                imitation_move=imitation_move,
             )
             p = save_shard(out_dir, feats, pi, z, result)
             if not quiet:
@@ -439,6 +467,11 @@ def main():
     ap.add_argument("--uci-movetime", type=int, default=200, help="expert think time per move in ms")
     ap.add_argument("--expert-multipv", type=int, default=6, help="use MultiPV candidates to build a soft target")
     ap.add_argument("--expert-alpha", type=float, default=0.7, help="mixing weight: pi = (1-a)*pi_mcts + a*pi_expert on expert turns")
+    ap.add_argument("--imitation-move", choices=["expert-sample", "expert-best", "random"],
+                    default="expert-sample",
+                    help="how we pick our own move when sims=0. expert-sample draws from the "
+                         "expert's distribution (realistic game length, still varied); random "
+                         "loses in a handful of plies and yields only openings and lost positions.")
     ap.add_argument("--expert-cp-scale", type=float, default=174.0,
                     help="centipawn scale of the softmax over engine scores. 174 = 400/ln(10), "
                          "matching the standard centipawn-to-win-probability conversion. Larger "
@@ -478,7 +511,8 @@ def main():
                   predict_fn, args.quiet, encode_cfg,
                   args.uci_path, expert_color_white, float(args.expert_alpha), int(args.expert_multipv), int(args.uci_movetime),
                   int(args.resign_cp), int(args.resign_plies), int(args.sf_threads), int(args.sf_hash), sf_skill,
-                  int(args.eval_batch_size), float(args.expert_cp_scale)),
+                  int(args.eval_batch_size), float(args.expert_cp_scale),
+                  str(args.imitation_move)),
             daemon=True
         )
         th.start()

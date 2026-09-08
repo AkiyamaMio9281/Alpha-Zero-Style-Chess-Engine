@@ -120,3 +120,64 @@ def test_cp_scale_controls_how_sharp_the_soft_targets_are():
     assert flat < 1.15                          # the old default: nearly uniform
     assert default > 1.6                        # win-probability scale
     assert sharp > default                      # smaller scale is sharper
+
+
+# ----- how we pick our own move during the imitation phase -----
+
+from selfplay_uci import _pick_imitation_move
+
+
+def _pi_over(legal_map, weights):
+    """Build a policy vector giving the first len(weights) legal moves those
+    weights, normalised."""
+    pi = np.zeros((ACTION_SIZE,), dtype=np.float32)
+    for idx, w in zip(list(legal_map.keys())[:len(weights)], weights):
+        pi[idx] = w
+    return pi / pi.sum()
+
+
+def test_expert_best_takes_the_argmax():
+    board, legal_map, legal_idx = _position()
+    pi = _pi_over(legal_map, [0.1, 0.7, 0.2])
+    expected = legal_map[list(legal_map.keys())[1]]
+
+    rng = np.random.default_rng(0)
+    for _ in range(5):
+        assert _pick_imitation_move(pi, legal_map, legal_idx, "expert-best", rng) == expected
+
+
+def test_expert_sample_stays_inside_the_expert_support():
+    """Sampling has to vary the line -- that is the whole point -- but never
+    wander outside the moves the expert actually proposed."""
+    board, legal_map, legal_idx = _position()
+    pi = _pi_over(legal_map, [0.5, 0.3, 0.2])
+    support = {legal_map[k] for k in list(legal_map.keys())[:3]}
+
+    rng = np.random.default_rng(1)
+    drawn = {_pick_imitation_move(pi, legal_map, legal_idx, "expert-sample", rng)
+             for _ in range(60)}
+
+    assert drawn <= support
+    assert len(drawn) > 1
+
+
+def test_random_ignores_the_policy():
+    board, legal_map, legal_idx = _position()
+    pi = _pi_over(legal_map, [1.0])                 # all mass on one move
+    only = legal_map[list(legal_map.keys())[0]]
+
+    rng = np.random.default_rng(2)
+    drawn = {_pick_imitation_move(pi, legal_map, legal_idx, "random", rng) for _ in range(60)}
+
+    assert len(drawn) > 1 and drawn != {only}       # spread across legal moves
+    assert all(mv in legal_map.values() for mv in drawn)
+
+
+def test_falls_back_to_random_when_the_expert_returned_nothing():
+    board, legal_map, legal_idx = _position()
+    empty = np.zeros((ACTION_SIZE,), dtype=np.float32)
+
+    rng = np.random.default_rng(3)
+    for policy in ("expert-sample", "expert-best"):
+        mv = _pick_imitation_move(empty, legal_map, legal_idx, policy, rng)
+        assert mv in legal_map.values()
