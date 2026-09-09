@@ -8,11 +8,12 @@ from engine import EncodeConfig, legal_moves_index_map, ACTION_SIZE, encode_boar
 from mcts import MCTS, human_play_config
 from predict import load_predictor
 
-def build_ai(checkpoint: str, device: str, channels: int, resblocks: int, in_planes: int):
+def build_ai(checkpoint: str, device: str, channels: int, resblocks: int, in_planes: int,
+             cuda_graph: bool = False):
     predict = load_predictor(
         checkpoint=checkpoint,
         in_planes=in_planes, channels=channels, resblocks=resblocks,
-        amp=False, device=device if device else None,
+        amp=False, device=device if device else None, cuda_graph=cuda_graph,
     )
     return predict
 
@@ -28,6 +29,31 @@ def ai_choose_move(board: chess.Board, history: List[chess.Board], predict_fn, s
     move, _ = mcts.select_action(tau=0.0)  # greedy by visit count
     return move
 
+
+def describe(board: chess.Board, history: List[chess.Board], predict_fn,
+             history_T: int, top_k: int = 5) -> str:
+    """What the network thinks of this position, before any search.
+
+    Useful for judging a checkpoint by hand: the value head and the raw policy
+    say more about what was learned than the move search finally picks, and
+    they are what the training targets were actually shaped like.
+    """
+    feats = encode_board(board,
+                         prev_boards=history[-(history_T - 1):] if history else None,
+                         cfg=EncodeConfig(history=history_T))
+    logits, value = predict_fn([feats])
+    legal = legal_moves_index_map(board)
+    idx = np.fromiter(legal.keys(), dtype=np.int32)
+    x = logits[0][idx].astype(np.float64)
+    x = np.exp(x - x.max())
+    x /= x.sum()
+    order = np.argsort(-x)[:top_k]
+    moves = "  ".join(f"{legal[int(idx[o])].uci()} {x[o]:.3f}" for o in order)
+    side = "White" if board.turn else "Black"
+    head = f"  value ({side} to move): {float(value[0]):+.3f}   [+1 = side to move wins]"
+    return head + chr(10) + f"  policy: {moves}"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
@@ -38,15 +64,19 @@ def main():
     ap.add_argument("--channels", type=int, default=128)
     ap.add_argument("--resblocks", type=int, default=12)
     ap.add_argument("--in-planes", type=int, default=102)
+    ap.add_argument("--cuda-graph", action="store_true",
+                    help="replay the forward pass as a CUDA graph; cuts per-move latency a lot "
+                         "at these small batch sizes (CUDA only, falls back to eager)")
     args = ap.parse_args()
 
-    predict_fn = build_ai(args.checkpoint, args.device, args.channels, args.resblocks, args.in_planes)
+    predict_fn = build_ai(args.checkpoint, args.device, args.channels, args.resblocks,
+                          args.in_planes, args.cuda_graph)
 
     board = chess.Board()
     history: List[chess.Board] = []
     move_no = 0
 
-    print("UCI input like 'e2e4', commands: 'undo', 'fen', 'board', 'quit'.")
+    print("Enter moves in UCI (e2e4). Commands: undo, fen, board, quit.")
     print(board, "\n")
 
     human_white = (args.human == "white")
@@ -60,14 +90,16 @@ def main():
 
     while True:
         try:
-            s = input("你走: ").strip().lower()
+            s = input("your move: ").strip().lower()
         except (KeyboardInterrupt, EOFError):
-            print("\n退出。"); break
+            print("\nbye."); break
         if s in ("q", "quit", "exit"): break
         if s in ("b", "board"):
             print(board, "\n"); continue
         if s == "fen":
             print(board.fen()); continue
+        if s in ("e", "eval"):
+            print(describe(board, history, predict_fn, args.history) + chr(10)); continue
         if s in ("u", "undo"):
             # pop AI move then human move if present
             if len(board.move_stack) > 0: board.pop()
@@ -79,9 +111,9 @@ def main():
         try:
             mv = chess.Move.from_uci(s)
         except Exception:
-            print("格式错误，用UCI（如 e2e4）。"); continue
+            print("Bad format -- use UCI, e.g. e2e4."); continue
         if mv not in board.legal_moves:
-            print("非法走子。"); continue
+            print("Illegal move."); continue
 
         prev_board = board.copy(stack=False)
         board.push(mv)
@@ -90,7 +122,7 @@ def main():
 
         if board.is_game_over(claim_draw=True):
             oc = board.outcome(claim_draw=True)
-            print(f"对局结束: {oc.result() if oc else '*'}  {oc.termination if oc else ''}")
+            print(f"Game over: {oc.result() if oc else '*'}  {oc.termination if oc else ''}")
             break
 
         t0 = time.time()
@@ -104,7 +136,7 @@ def main():
 
         if board.is_game_over(claim_draw=True):
             oc = board.outcome(claim_draw=True)
-            print(f"对局结束: {oc.result() if oc else '*'}  {oc.termination if oc else ''}")
+            print(f"Game over: {oc.result() if oc else '*'}  {oc.termination if oc else ''}")
             break
 
 if __name__ == "__main__":
