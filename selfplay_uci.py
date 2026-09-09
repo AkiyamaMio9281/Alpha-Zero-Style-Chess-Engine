@@ -404,12 +404,31 @@ def play_one_game_vs_expert(predict_fn,
 
     return feats_list, pi_list, z_list, result
 
+
+def expert_is_white(opponent_color: str, worker_idx: int, game_idx: int) -> bool:
+    """Which colour the expert takes for one game.
+
+    "alternate" swaps every game. With a fixed colour the same side loses every
+    game -- the engine is stronger than we are -- and although z then comes out
+    numerically balanced, because both perspectives are recorded, it is
+    perfectly correlated with which side you are. The encoding is side-to-move
+    relative but a position still reveals whether you moved first, so the value
+    head learns "am I the engine" rather than "who is winning". Trained on 200
+    fixed-colour games it returned -1.000 for the starting position and +1.000
+    after 1.e4. Offsetting by the worker index keeps the split even when each
+    worker plays an odd number of games.
+    """
+    if opponent_color == "alternate":
+        return (worker_idx + game_idx) % 2 == 0
+    return opponent_color == "white"
+
+
 # ------------------------------
 # Worker & main
 # ------------------------------
 def _worker_loop(idx: int, num_games: int, sims: int, temperature_moves: int,
                  out_dir: str, max_plies: int, predict_fn, quiet: bool, encode_cfg: EncodeConfig,
-                 uci_path: str, expert_color_white: bool, expert_alpha: float, expert_multipv: int, expert_movetime: int,
+                 uci_path: str, opponent_color: str, expert_alpha: float, expert_multipv: int, expert_movetime: int,
                  resign_cp: int, resign_plies: int, sf_threads: int, sf_hash: int, sf_skill: Optional[int],
                  eval_batch_size: int = 1, cp_scale: float = 174.0,
                  imitation_move: str = "expert-sample"):
@@ -418,8 +437,10 @@ def _worker_loop(idx: int, num_games: int, sims: int, temperature_moves: int,
                        cp_scale=cp_scale)  # one engine per worker
     try:
         for g in range(num_games):
+            expert_color_white = expert_is_white(opponent_color, idx, g)
             if not quiet:
-                print(f"[thread {idx}] starting game {g+1}/{num_games}")
+                side = "W" if expert_color_white else "B"
+                print(f"[thread {idx}] starting game {g+1}/{num_games} (expert plays {side})")
             feats, pi, z, result = play_one_game_vs_expert(
                 predict_fn, sims, temperature_moves, rng, max_plies, quiet, encode_cfg,
                 expert, expert_color_white, expert_alpha, expert_multipv, expert_movetime,
@@ -463,7 +484,11 @@ def main():
 
     # Expert options
     ap.add_argument("--uci-path", type=str, required=True, help="path to UCI engine executable (e.g., stockfish)")
-    ap.add_argument("--opponent-color", choices=["white", "black"], default="black", help="which color the expert plays")
+    ap.add_argument("--opponent-color", choices=["white", "black", "alternate"], default="alternate",
+                    help="which colour the expert plays. 'alternate' swaps every game, which is "
+                         "the default because a fixed colour makes the outcome predictable from "
+                         "which side you are and the value head learns that instead of the "
+                         "position.")
     ap.add_argument("--uci-movetime", type=int, default=200, help="expert think time per move in ms")
     ap.add_argument("--expert-multipv", type=int, default=6, help="use MultiPV candidates to build a soft target")
     ap.add_argument("--expert-alpha", type=float, default=0.7, help="mixing weight: pi = (1-a)*pi_mcts + a*pi_expert on expert turns")
@@ -493,7 +518,6 @@ def main():
     predict_fn = build_predictor(args)
     encode_cfg = EncodeConfig(history=args.history)
 
-    expert_color_white = (args.opponent_color == "white")
     sf_skill = None if args.skill_level < 0 else int(args.skill_level)
 
     # Threading: split games evenly, remainder to the first threads (matches selfplay.py)
@@ -509,7 +533,7 @@ def main():
             target=_worker_loop,
             args=(i, n, args.sims, args.temperature_moves, args.out, args.max_plies,
                   predict_fn, args.quiet, encode_cfg,
-                  args.uci_path, expert_color_white, float(args.expert_alpha), int(args.expert_multipv), int(args.uci_movetime),
+                  args.uci_path, str(args.opponent_color), float(args.expert_alpha), int(args.expert_multipv), int(args.uci_movetime),
                   int(args.resign_cp), int(args.resign_plies), int(args.sf_threads), int(args.sf_hash), sf_skill,
                   int(args.eval_batch_size), float(args.expert_cp_scale),
                   str(args.imitation_move)),

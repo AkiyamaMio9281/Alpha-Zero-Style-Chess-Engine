@@ -181,3 +181,30 @@ def test_falls_back_to_random_when_the_expert_returned_nothing():
     for policy in ("expert-sample", "expert-best"):
         mv = _pick_imitation_move(empty, legal_map, legal_idx, policy, rng)
         assert mv in legal_map.values()
+
+
+# ----- which colour the expert takes -----
+
+from selfplay_uci import expert_is_white
+
+
+@pytest.mark.parametrize("colour, expected", [("white", True), ("black", False)])
+def test_fixed_colour_never_changes(colour, expected):
+    assert all(expert_is_white(colour, w, g) is expected
+               for w in range(4) for g in range(10))
+
+
+def test_alternate_splits_evenly_within_a_worker():
+    """A fixed colour means the same side loses every game, and the value head
+    learns which side it is instead of who is winning: trained on 200
+    fixed-colour games it returned -1.000 for the starting position."""
+    for worker in range(4):
+        colours = [expert_is_white("alternate", worker, g) for g in range(50)]
+        assert sum(colours) == 25
+
+
+def test_alternate_stays_even_across_workers_with_odd_game_counts():
+    """Each worker playing an odd number of games would skew every worker the
+    same way without the worker offset."""
+    colours = [expert_is_white("alternate", w, g) for w in range(4) for g in range(7)]
+    assert abs(sum(colours) - len(colours) / 2) <= 1

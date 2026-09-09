@@ -87,7 +87,8 @@ def main():
                     help="MCTS leaves evaluated per network call inside one search")
     ap.add_argument("--cuda-graph", action=argparse.BooleanOptionalAction, default=True,
                     help="capture the forward pass as a CUDA graph and replay it. Verified bit-identical to eager and falls back automatically, so it is on by default here; --no-cuda-graph disables it.")
-    ap.add_argument("--opponent-color", choices=["white","black"], default="black")
+    ap.add_argument("--opponent-color", choices=["white", "black", "alternate"], default="alternate",
+                    help="which colour the expert plays; 'alternate' swaps every game (see selfplay_uci.py)")
     # Training options
     ap.add_argument("--epochs", type=int, default=2, help="epochs per iteration")
     ap.add_argument("--steps-per-epoch", type=int, default=2000)
