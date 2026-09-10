@@ -8,6 +8,7 @@ main() with the subprocess runner replaced by a recorder, and assert on the
 commands it built.
 """
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -242,3 +243,78 @@ def test_start_iter_resumes_the_curriculum_where_it_stopped(tmp_path, monkeypatc
     assert int(_arg(sp[0], "--sims")) > 0, "resumed at the start of the curriculum, not at iteration 8"
     # and the data dir is stamped with the real iteration number
     assert "it8_" in _arg(sp[0], "--out")
+
+
+def test_each_iteration_tags_its_checkpoint(tmp_path, monkeypatch):
+    """Checkpoint names are derived from epoch and step. A rejected iteration
+    restarts the next one from the same weights, which produces the same epoch
+    and step and therefore the same filename -- the earlier checkpoint is
+    overwritten. Ten iterations left five files."""
+    calls = []
+
+    def run_cmd(args, cwd=None):
+        args = [str(a) for a in args]
+        calls.append(args)
+        if "trainer.py" in " ".join(args):
+            out = Path(_arg(args, "--out"))
+            out.mkdir(parents=True, exist_ok=True)
+            path = out / f"model_{_arg(args, '--tag')}.pt"
+            path.touch()
+            os.utime(path, (1_000_000 + len(calls),) * 2)
+        return 0, ""
+
+    monkeypatch.setattr(autoloopexpert, "run_cmd", run_cmd)
+    monkeypatch.setattr(autoloopexpert, "save_state", lambda *a, **k: None)
+    monkeypatch.setattr(sys, "argv", [
+        "autoloopexpert.py", "--stockfish", "sf.exe",
+        "--ckpt-dir", str(tmp_path / "ckpt"), "--data-root", str(tmp_path / "data"),
+        "--iters", "3", "--games", "2", "--steps-per-epoch", "10",
+    ])
+    autoloopexpert.main()
+
+    tags = [_arg(c, "--tag") for c in _cmds(calls, "trainer.py")]
+    assert tags == ["it1", "it2", "it3"]
+    assert len(set(tags)) == 3          # distinct, so nothing overwrites
+
+
+def test_resume_prefers_the_promoted_checkpoint_over_the_newest_file(tmp_path, monkeypatch):
+    """A rejected iteration still writes a checkpoint, and it is the newest file
+    afterwards. Picking by mtime therefore resumes from weights the arena had
+    just turned down -- which is exactly the state a real ten-iteration run
+    ended in."""
+    ckpt_dir = tmp_path / "ckpt"
+    ckpt_dir.mkdir()
+    promoted = ckpt_dir / "model_it9.pt"
+    rejected = ckpt_dir / "model_it10.pt"
+    promoted.touch(); os.utime(promoted, (1_000_000,) * 2)
+    rejected.touch(); os.utime(rejected, (2_000_000,) * 2)      # newer on disk
+
+    state = tmp_path / "autoloopexpert_state.json"
+    state.write_text(json.dumps({
+        "iters_done": 10,
+        "history": [{"iteration": 10, "promoted": False, "active_ckpt": str(promoted)}],
+    }))
+    monkeypatch.setattr(autoloopexpert.Path, "resolve", lambda self: tmp_path / "x.py")
+
+    calls = []
+
+    def run_cmd(args, cwd=None):
+        args = [str(a) for a in args]
+        calls.append(args)
+        if "trainer.py" in " ".join(args):
+            out = Path(_arg(args, "--out")); out.mkdir(parents=True, exist_ok=True)
+            (out / f"model_{_arg(args, '--tag')}.pt").touch()
+        return 0, ""
+
+    monkeypatch.setattr(autoloopexpert, "run_cmd", run_cmd)
+    monkeypatch.setattr(autoloopexpert, "save_state", lambda *a, **k: None)
+    monkeypatch.setattr(sys, "argv", [
+        "autoloopexpert.py", "--stockfish", "sf.exe",
+        "--ckpt-dir", str(ckpt_dir), "--data-root", str(tmp_path / "data"),
+        "--iters", "1", "--games", "2", "--steps-per-epoch", "10",
+    ])
+    autoloopexpert.main()
+
+    first_selfplay = _cmds(calls, "selfplay_uci.py")[0]
+    assert _arg(first_selfplay, "--checkpoint") == str(promoted), \
+        "resumed from the rejected checkpoint"

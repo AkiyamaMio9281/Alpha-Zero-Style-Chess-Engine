@@ -5,6 +5,7 @@ import os, sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import argparse
+import math
 from typing import List, Tuple
 import numpy as np
 import chess
@@ -77,7 +78,30 @@ def main():
     w = results.count("1-0")
     l = results.count("0-1")
     d = results.count("1/2-1/2")
-    print(f"[arena] NEW vs OLD  W:{w}  L:{l}  D:{d}  Win%={(w + 0.5*d) / max(1, len(results)) * 100:.1f}%")
+    n = max(1, len(results))
+    score = (w + 0.5 * d) / n
+
+    # A win rate on its own reads as more precise than it is. At 20 games one
+    # standard error is about 11 points, so two identical engines clear a 55%
+    # promotion bar by luck roughly a third of the time. Printing the interval
+    # and the Elo makes that visible in the log instead of something you have
+    # to know to simulate.
+    per_game = [1.0 if r == "1-0" else (0.5 if r == "1/2-1/2" else 0.0) for r in results]
+    var = sum((x - score) ** 2 for x in per_game) / max(1, n - 1)
+    se = math.sqrt(var / n)
+    lo, hi = max(0.0, score - 1.96 * se), min(1.0, score + 1.96 * se)
+
+    def elo(p_: float) -> float:
+        p_ = min(max(p_, 1e-6), 1 - 1e-6)
+        return -400.0 * math.log10(1.0 / p_ - 1.0)
+
+    print(f"[arena] NEW vs OLD  W:{w}  L:{l}  D:{d}  Win%={score * 100:.1f}%")
+    print(f"[arena] 95% CI: {lo * 100:.1f}% .. {hi * 100:.1f}%  "
+          f"(+-{1.96 * se * 100:.1f} pts over {n} games)   "
+          f"Elo {elo(score):+.0f} [{elo(lo):+.0f}, {elo(hi):+.0f}]")
+    if hi - lo > 0.20:
+        print(f"[arena] NOTE: interval spans {(hi - lo) * 100:.0f} points -- "
+              f"too few games to separate these checkpoints. Raise --games.")
 
 if __name__ == "__main__":
     main()

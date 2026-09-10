@@ -134,10 +134,23 @@ def main():
 
     # Determine initial checkpoint
     cur_ckpt = args.start_ckpt.strip()
+    if not cur_ckpt and state_path.exists():
+        # Prefer the checkpoint the arena last promoted over whatever is newest
+        # on disk. A rejected iteration still writes its checkpoint, and it is
+        # the newest file afterwards, so picking by mtime resumes from weights
+        # the arena had just turned down.
+        try:
+            prior = json.loads(state_path.read_text())
+            recorded = (prior.get("history") or [{}])[-1].get("active_ckpt", "")
+            if recorded and Path(recorded).exists():
+                cur_ckpt = recorded
+                print(f"[autoloop] Resuming from last promoted ckpt in {state_path.name}: {cur_ckpt}")
+        except Exception as e:
+            print(f"[autoloop] could not read {state_path.name} ({e}); falling back to newest on disk.")
     if not cur_ckpt:
         cur_ckpt = latest_ckpt(args.ckpt_dir) or ""
         if cur_ckpt:
-            print(f"[autoloop] Found latest ckpt: {cur_ckpt}")
+            print(f"[autoloop] Found latest ckpt by mtime: {cur_ckpt}")
     if cur_ckpt and not Path(cur_ckpt).exists():
         print(f"[autoloop] WARNING: start-ckpt not found: {cur_ckpt}. Will fallback to dummy for selfplay.")
         cur_ckpt = ""
@@ -233,6 +246,7 @@ def main():
             "--steps-per-epoch", str(args.steps_per_epoch),
             "--batch-size", str(args.batch_size),
             "--out", str(args.ckpt_dir),
+            "--tag", f"it{it}",
         ]
         if not args.no_resume:
             if args.resume or (cur_ckpt and Path(cur_ckpt).exists()):

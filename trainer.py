@@ -184,6 +184,12 @@ def main():
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--out", type=str, default="ckpt")
     ap.add_argument("--resume", type=str, default="")
+    ap.add_argument("--tag", type=str, default="",
+                    help="inserted into the checkpoint filename. Without it the name is derived "
+                         "from epoch and step alone, so two runs resuming from the same "
+                         "checkpoint write the same file and the earlier one is lost -- which is "
+                         "what happens every time an autoloop iteration is rejected and the next "
+                         "one restarts from the same weights.")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -237,7 +243,8 @@ def main():
             files_per_batch=args.files_per_batch,
         )
         global_step += args.steps_per_epoch
-        ckpt_path = os.path.join(args.out, f"model_ep{ep}_step{global_step}.pt")
+        tag = f"{args.tag}_" if args.tag else ""
+        ckpt_path = os.path.join(args.out, f"model_{tag}ep{ep}_step{global_step}.pt")
         save_ckpt(model, optimizer, ckpt_path, epoch=ep, step=global_step)
         print(f"[ckpt] saved: {ckpt_path}   stats: {stats}", flush=True)
 
