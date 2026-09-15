@@ -6,14 +6,16 @@ from model import ACTION_SIZE, AlphaZeroChess, ModelConfig
 
 
 def _tiny_cfg(**kw) -> ModelConfig:
-    # 这里测的是策略头的输出性质与展平顺序，小网络就够，不需要 12 个 resblock。
+    # These tests cover the policy head's output properties and flatten order, so a
+    # small network is enough -- no need for 12 residual blocks.
     return ModelConfig(in_planes=102, channels=16, resblocks=1, **kw)
 
 
 def test_policy_logits_can_be_negative():
-    """输出层一旦带上 BN/ReLU，logits 就被钳成非负：所有被抑制的走法塌到同一个
-    值，softmax 之后完全无法区分。训练照跑、loss 照降，只是学不出策略——正是
-    那种不会崩、只会静默训练垃圾的 bug。"""
+    """With BN/ReLU on the output layer the logits are clamped non-negative: every
+    suppressed move collapses to the same value and becomes indistinguishable after
+    softmax. Training runs and the loss falls, it just never learns a policy --
+    exactly the kind of bug that never crashes and silently trains on garbage."""
     model = AlphaZeroChess(_tiny_cfg())
     model.eval()
     with torch.no_grad():
@@ -35,13 +37,14 @@ def test_forward_shapes_and_value_range():
 
 
 def test_policy_planes_flatten_order_is_from_sq_times_73_plus_plane():
-    """策略头把 (B,73,8,8) 展平成 engine 的 from_sq*73+plane 顺序。顺序错位不会
-    报错，只会让每条策略目标都对到别的走法上。"""
+    """The policy head flattens (B,73,8,8) into the engine's from_sq*73+plane order.
+    Getting that order wrong raises nothing; it just lines every policy target up
+    with the wrong move."""
     model = AlphaZeroChess(_tiny_cfg())
     model.eval()
 
-    # 用可预测的输出层替换 conv2：(plane, rank, file) 处的值 = plane*100 + from_sq，
-    # 其中 from_sq = rank*8 + file（与 chess.square(file, rank) 一致）。
+    # Replace conv2 with a predictable output: the value at (plane, rank, file) is
+    # plane*100 + from_sq, where from_sq = rank*8 + file, as in chess.square(file, rank).
     marker = (torch.arange(73).view(73, 1) * 100 + torch.arange(64).view(1, 64)).float()
 
     class _Marker(torch.nn.Module):
@@ -58,7 +61,8 @@ def test_policy_planes_flatten_order_is_from_sq_times_73_plus_plane():
 
 
 def test_fc_policy_head_still_builds():
-    # policy_type="fc" 是旧 checkpoint 的兼容路径，改 planes 头时别把它弄坏。
+    # policy_type="fc" is the compatibility path for old checkpoints; changing the
+    # planes head must not break it.
     model = AlphaZeroChess(_tiny_cfg(policy_type="fc"))
     model.eval()
     with torch.no_grad():

@@ -18,11 +18,11 @@ from engine import (
 from mcts import MCTS, self_play_config
 from net.batch_predict import make_batched_predictor
 
-# ===== 即时日志 =====
+# ===== Unbuffered logging =====
 def log(*a, **k):
     print(*a, **k, flush=True)
 
-# ===== Dummy evaluator（均匀先验 + 价值0）=====
+# ===== Dummy evaluator (uniform prior, zero value) =====
 def dummy_predict(feats_batch: List[np.ndarray]):
     B = len(feats_batch)
     logits = np.zeros((B, 4672), dtype=np.float32)
@@ -69,11 +69,10 @@ def play_one_game(predict_fn, sims: int, temperature_moves: int,
                 n_legal = len(list(board.legal_moves))
             log(f"[game] move_no={move_no}, legal={n_legal}")
 
-        # 如果 sims <= 0：直接在合法步里均匀抽样（更快地攒随机数据）
+        # With sims <= 0, sample uniformly among legal moves (collects random data faster).
         if sims <= 0:
             legal = list(board.legal_moves)
-            # 记录特征与均匀 π
-            # 记录特征与“合法步均匀” π
+            # Record the features and a pi that is uniform over the legal moves.
             feats = encode_board(board, prev_boards=history[-(encode_cfg.history-1):] if history else None, cfg=encode_cfg)
 
             legal_map = legal_moves_index_map(board)               # {idx -> Move}
@@ -87,7 +86,7 @@ def play_one_game(predict_fn, sims: int, temperature_moves: int,
             pi_list.append(pi)
             persp_list.append(board.turn)
 
-# 选招并推进
+            # Choose a move and advance.
             mv = legal_map[int(legal_idx[rng.integers(legal_idx.size)])]
             prev_board = board.copy(stack=False)
             board.push(mv)
@@ -96,7 +95,7 @@ def play_one_game(predict_fn, sims: int, temperature_moves: int,
             continue
 
 
-        # 用 MCTS 搜索
+        # Search with MCTS.
         mcts = MCTS(
             predict_fn=predict_fn,
             mcts_cfg=self_play_config(sims=sims),
@@ -152,7 +151,7 @@ def save_shard(out_dir: str, feats_list, pi_list, z_list, result: str) -> str:
     return path
 
 def _build_predict_fn(args) -> Callable[[List[np.ndarray]], Tuple[np.ndarray, np.ndarray]]:
-    # 选择预测器：如提供 checkpoint 就加载真模型；否则用 dummy
+    # Pick the predictor: the real model when a checkpoint is given, otherwise the dummy.
     if args.checkpoint and args.checkpoint.strip().lower() not in ("", "none"):
         try:
             from predict import load_predictor
@@ -163,7 +162,7 @@ def _build_predict_fn(args) -> Callable[[List[np.ndarray]], Tuple[np.ndarray, np
                 device=(args.device if args.device else None),
                 cuda_graph=args.cuda_graph,
             )
-            # 批量聚合开关
+            # Request batching switch.
             if args.batch_max > 1:
                 predict_fn = make_batched_predictor(base_predict, max_batch=args.batch_max, max_wait_ms=args.batch_wait_ms)
                 log(f"[selfplay] using checkpoint (batched x{args.batch_max}): {args.checkpoint}")
@@ -197,7 +196,7 @@ def main():
     ap.add_argument("--temperature-moves", type=int, default=20)
     ap.add_argument("--max-plies", type=int, default=300)
     ap.add_argument("--out", type=str, default="data/shards")
-    # 可选 checkpoint 与模型规模
+    # Optional checkpoint and model size.
     ap.add_argument("--checkpoint", type=str, default="", help="optional model checkpoint for inference")
     ap.add_argument("--channels", type=int, default=128)
     ap.add_argument("--resblocks", type=int, default=12)
@@ -205,12 +204,12 @@ def main():
     ap.add_argument("--cuda-graph", action="store_true",
                     help="capture the forward pass as a CUDA graph and replay it; removes per-kernel launch overhead (CUDA only, falls back to eager)")
     ap.add_argument("--device", type=str, default="", help="e.g., cuda or cpu")
-    # 批量推理参数
-    ap.add_argument("--batch-max", type=int, default=128, help=">=2 启用批量聚合；1 表示关闭")
+    # Batched inference.
+    ap.add_argument("--batch-max", type=int, default=128, help=">=2 enables request batching; 1 disables it")
     ap.add_argument("--batch-wait-ms", type=int, default=5)
-    # 静默
+    # Quiet output.
     ap.add_argument("--quiet", action="store_true")
-    # 编码历史长度（与 engine.EncodeConfig 对齐）
+    # Encoding history length (matches engine.EncodeConfig).
     ap.add_argument("--history", type=int, default=8)
     args = ap.parse_args()
 

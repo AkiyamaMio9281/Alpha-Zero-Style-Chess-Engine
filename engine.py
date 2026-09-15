@@ -20,9 +20,9 @@ KNIGHT_DELTAS: List[Tuple[int,int]] = [
     (1, 2), (2, 1), (2, -1), (1, -2),
     (-1, -2), (-2, -1), (-2, 1), (-1, 2)
 ]
-# 兵升变的三个方向（相对于“行棋方朝上”的坐标系）
+# The three under-promotion directions, in the frame where the side to move plays upward.
 PROMO_DIRS: List[Tuple[int,int]] = [(-1, 1), (0, 1), (1, 1)]
-PROMO_PIECES = [chess.KNIGHT, chess.BISHOP, chess.ROOK]  # Q 用滑走平面
+PROMO_PIECES = [chess.KNIGHT, chess.BISHOP, chess.ROOK]  # queen promotions use the sliding planes
 
 @dataclass
 class EncodeConfig:
@@ -231,7 +231,7 @@ def encode_board(
             else:
                 frames.append(frames[-1])
 
-    # 固定帧数：不足 T 用“最早一帧”补齐；超出则截断
+    # Fixed frame count: pad with the earliest frame when short of T, truncate when longer.
     if len(frames) >= T:
         frames = frames[:T]
     else:
@@ -241,7 +241,7 @@ def encode_board(
             pad = [frames[-1]] * (T - len(frames))
             frames = frames + pad
 
-    # 所有历史帧都用当前行棋方的视角，而不是各帧自己的。
+    # Every history frame uses the current player's perspective, not its own.
     persp = board.turn
     plane_list = [_encode_frame(fb, persp) for fb in frames]  # T × (12,8,8)
     planes = np.concatenate(plane_list, axis=0)        # (T*12,8,8)

@@ -1,10 +1,12 @@
 # selfplay_uci.py (expert-vs-self data generator with curriculum knobs)
 from __future__ import annotations
 r"""
-生成“和UCI专家（如Stockfish）对弈”的训练数据（AlphaZero风格 π、z），可选混合自家MCTS分布。
-支持：每线程独立引擎、防崩重启、Skill Level、早投降、纯模仿/均匀先验等。
+Generate training data from games against a UCI expert such as Stockfish
+(AlphaZero-style pi and z targets), optionally mixing in our own MCTS distribution.
+Supports one engine per worker thread, restarting a crashed engine, Skill Level,
+early resignation, and a pure-imitation mode.
 
-示例（纯模仿启动）：
+Example (pure-imitation cold start):
 python selfplay_uci.py ^
   --games 200 --threads 4 ^
   --sims 0 --temperature-moves 0 ^
@@ -17,7 +19,7 @@ python selfplay_uci.py ^
   --expert-alpha 1.0 ^
   --skill-level 5
 
-示例（混回自博弈）：
+Example (mixing self-play back in):
 python selfplay_uci.py ^
   --games 120 --threads 4 ^
   --sims 300 --temperature-moves 12 ^

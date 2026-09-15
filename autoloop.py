@@ -17,13 +17,13 @@ def run_stream(cmd: list[str], cwd: Path = HERE, env: dict | None = None) -> str
     Returns the full captured stdout for post-parsing.
     """
     print(f"\n$ {' '.join(cmd)}\n", flush=True)
-    # 确保非缓冲输出：-u + 环境变量
+    # Force unbuffered output: -u plus the environment variable.
     proc_env = os.environ.copy()
     proc_env["PYTHONUNBUFFERED"] = "1"
     if env:
         proc_env.update(env)
 
-    # 逐行读取并原样打印（Windows/Unix 均可）
+    # Read and echo line by line (works on Windows and Unix).
     p = subprocess.Popen(
         cmd, cwd=str(cwd),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -94,11 +94,11 @@ def main():
     for r in range(1, args.rounds + 1):
         print(f"\n========== ROUND {r}/{args.rounds}  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ==========", flush=True)
 
-        # 1) 自博弈
+        # 1) Self-play
         gen_dir = data_root / f"gen{r}"
         gen_dir.mkdir(parents=True, exist_ok=True)
         sp_cmd = [
-            PY, "-u", SELFPLAY,  # -u 确保子进程不缓冲
+            PY, "-u", SELFPLAY,  # -u keeps the child unbuffered
             "--games", str(args.games),
             "--threads", str(args.threads),
             "--sims", str(args.sims),
@@ -118,8 +118,9 @@ def main():
             sp_cmd += ["--checkpoint", current_ckpt]
         out_sp = run_stream(sp_cmd)
 
-        # 2) 训练：读整个 data_root（跨代回放窗口），而不是只看这一轮的 gen_dir。
-        # 窗口大小由下面的 --keep-gens 磁盘清理控制。
+        # 2) Train on the whole data_root -- a replay window across generations --
+        # not just this round's gen_dir. The window size is set by the --keep-gens
+        # pruning below.
         tr_cmd = [
             PY, "-u", TRAINER,
             "--data", str(data_root),
@@ -132,19 +133,21 @@ def main():
             "--lr", str(args.lr),
             "--out", str(ckpt_root),
         ]
-        # 从当前活跃的 checkpoint 续训，而不是每轮从随机权重重来。缺了这一步，
-        # 每轮训出来的都是全新的随机模型，arena 自然打不过上一代，于是
-        # 永远 REJECTED、current_ckpt 永远不更新，整个循环空转。而且 trainer 的
-        # 文件名由 epoch/step 决定，不续训的话每轮都叫 model_ep1_step<spe>.pt，
-        # 会把上一代权重直接覆盖，arena 于是在拿同一个文件自己跟自己下。
+        # Resume from the active checkpoint instead of starting every round from
+        # random weights. Without this each round trains a brand-new random model,
+        # the arena cannot beat the previous generation, every round is REJECTED,
+        # current_ckpt never advances, and the loop spins in place. Worse, trainer
+        # names checkpoints from epoch/step, so without resuming every round writes
+        # model_ep1_step<spe>.pt and overwrites the previous generation's weights,
+        # leaving the arena to play one file against itself.
         if current_ckpt and Path(current_ckpt).exists():
             tr_cmd += ["--resume", current_ckpt]
         out_tr = run_stream(tr_cmd)
         new_ckpt = parse_ckpt(out_tr)
         if not new_ckpt:
-            raise RuntimeError("无法在 trainer 输出中解析到 checkpoint 路径。")
+            raise RuntimeError("Could not parse a checkpoint path from the trainer output.")
 
-        # 3) 评测（第一轮没有旧模型则直接晋级）
+        # 3) Evaluate. The first round has no previous model, so it is promoted directly.
         promoted = False
         winp = None
         if current_ckpt:
@@ -169,7 +172,7 @@ def main():
             out_ar = run_stream(arena_cmd)
             winp = parse_win(out_ar)
             if winp is None:
-                raise RuntimeError("无法在 arena 输出中解析到 Win%。")
+                raise RuntimeError("Could not parse Win% from the arena output.")
             promoted = (winp >= args.promote_threshold)
             if promoted:
                 current_ckpt = new_ckpt
@@ -177,7 +180,7 @@ def main():
             promoted = True
             current_ckpt = new_ckpt
 
-        # 4) 记录与清理
+        # 4) Record and prune
         rec = {
             "round": r,
             "gen_dir": str(gen_dir),

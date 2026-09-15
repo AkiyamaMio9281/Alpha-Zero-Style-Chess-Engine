@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# AlphaZero policy head 输出 4672 维（8x8x73）
+# The AlphaZero policy head outputs 4672 logits (8x8x73).
 ACTION_SIZE = 4672
 
 class ResidualBlock(nn.Module):
@@ -23,7 +23,7 @@ class ResidualBlock(nn.Module):
         return F.relu(x + h)
 
 class PolicyHeadFC(nn.Module):
-    """旧版策略头：1x1 conv -> BN -> flatten -> FC(4672)。"""
+    """Legacy policy head: 1x1 conv -> BN -> flatten -> FC(4672)."""
     def __init__(self, in_channels: int, hidden: int = 2):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, hidden, kernel_size=1, bias=False)
@@ -37,12 +37,15 @@ class PolicyHeadFC(nn.Module):
         return logits
 
 class PolicyHeadPlanes(nn.Module):
-    """新版策略头：直接输出 73 个“动作平面”，保证与引擎的 from_sq*73+plane 顺序一致。
+    """Policy head that emits the 73 action planes directly, in the same
+    from_sq*73+plane order the engine uses.
 
-    输出层必须是裸 conv —— 不接 BN，也不接激活。早期版本把 73 通道的输出
-    直接套了 BN+ReLU，于是所有 logits >= 0：被抑制的走法全部被钳到 0，
-    softmax 之后概率完全相同，策略头根本没法区分它们，而且 ReLU 负半区
-    的梯度是死的。训练照跑、loss 照降，只是学不出策略。
+    The output layer must be a bare conv -- no BN and no activation. An earlier
+    version ran the 73-channel output through BN+ReLU, so every logit was >= 0:
+    every suppressed move was clamped to 0, came out with identical probability
+    after softmax, and the head had no way to tell them apart, with no gradient
+    in ReLU's negative half. Training ran and the loss fell; it just never
+    learned a policy.
     """
     def __init__(self, in_channels: int, hidden: Optional[int] = None):
         super().__init__()
@@ -53,10 +56,10 @@ class PolicyHeadPlanes(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = F.relu(self.bn1(self.conv1(x)))
-        h = self.conv2(h)  # (B, 73, 8, 8)，无激活，logits 可正可负
+        h = self.conv2(h)  # (B, 73, 8, 8), no activation, so logits can be negative
         # (B, 73, 8, 8) -> (B, 8, 8, 73) -> (B, 8*8*73)
-        # 展平后的下标即 (rank*8+file)*73 + plane = from_sq*73 + plane，
-        # 与 engine._from_plane_index 一致。
+        # The flattened index is (rank*8+file)*73 + plane = from_sq*73 + plane,
+        # matching engine._from_plane_index.
         B = h.size(0)
         logits = h.permute(0, 2, 3, 1).contiguous().view(B, 8 * 8 * 73)
         return logits
@@ -81,7 +84,7 @@ class ModelConfig:
     in_planes: int = 102      # C=102 (T=8 => 96 + aux 6)
     channels: int = 128
     resblocks: int = 12
-    policy_type: str = "planes"  # "planes"（推荐，严格对齐 8x8x73）或 "fc"（兼容旧结构）
+    policy_type: str = "planes"  # "planes" (recommended, aligned with 8x8x73) or "fc" (legacy)
 
 class AlphaZeroChess(nn.Module):
     def __init__(self, cfg: ModelConfig = ModelConfig()):
@@ -110,15 +113,15 @@ class AlphaZeroChess(nn.Module):
         value  = self.value(h)
         return logits, value
 
-# --------- load_model（带旧权重自动适配） ---------
+# --------- load_model (adapts legacy weights automatically) ---------
 import os
 
 def _guess_policy_type_from_state(sd: Dict[str, Any]) -> str:
-    """根据 checkpoint 的 key 猜测使用的是 'fc' 还是 'planes' 策略头。"""
+    """Guess from the checkpoint's keys whether it uses the 'fc' or 'planes' policy head."""
     has_fc = any(k.startswith("policy.fc.") for k in sd.keys())
     if has_fc:
         return "fc"
-    # 如果没有 fc 权重，按新版 planes 处理
+    # No fc weights, so treat it as the planes head.
     return "planes"
 
 def load_model(
@@ -128,8 +131,8 @@ def load_model(
 ) -> AlphaZeroChess:
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 如果给了 checkpoint，就先 peek 一下 policy 类型，确保构建匹配的结构；
-    # 如果没给，就按 cfg.policy_type 创建（默认 planes）。
+    # Given a checkpoint, peek at its policy type first so the matching structure
+    # is built; without one, build from cfg.policy_type (planes by default).
     sd = None
     if checkpoint and checkpoint.strip().lower() != "none" and os.path.exists(checkpoint):
         try:
@@ -148,7 +151,7 @@ def load_model(
 
     cfg_eff = cfg
     if sd is not None:
-        # 覆盖 policy_type 以匹配权重
+        # Override policy_type to match the weights.
         pt = _guess_policy_type_from_state(sd)
         if pt != cfg.policy_type:
             cfg_eff = ModelConfig(in_planes=cfg.in_planes, channels=cfg.channels,
@@ -156,13 +159,15 @@ def load_model(
 
     model = AlphaZeroChess(cfg_eff).to(device)
 
-    # 加载权重（strict=False 以允许不同策略头之间部分加载）
+    # Load weights. strict=False allows a partial load across policy-head variants.
     if sd is not None:
         missing, unexpected = model.load_state_dict(sd, strict=False)
-        # 修策略头输出激活之前存的 planes checkpoint 用的是 policy.conv/policy.bn，
-        # 新结构是 policy.conv1/bn1/conv2，整个策略头会 missing 掉。这必须显式说
-        # 清楚：stem/tower/value 头都照常恢复了，唯独策略头是随机初始化的，需要
-        # 重新训练——否则很容易以为在续训，却对棋力突然变差摸不着头脑。
+        # A planes checkpoint saved before the policy-head fix uses policy.conv and
+        # policy.bn, while the current structure is policy.conv1/bn1/conv2, so the
+        # whole policy head goes missing. Say so explicitly: the stem, tower and value
+        # head resumed normally, but the policy head is randomly initialised and needs
+        # retraining. Otherwise it looks like an ordinary resume and the sudden drop in
+        # strength is baffling.
         if any(k.startswith("policy.") for k in missing):
             print("[load_model] WARNING: policy head weights were NOT restored and are "
                   "randomly initialized (this checkpoint predates the policy-head fix "

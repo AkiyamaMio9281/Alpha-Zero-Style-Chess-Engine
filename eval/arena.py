@@ -51,7 +51,7 @@ def main():
                     help="capture the forward pass as a CUDA graph and replay it; removes per-kernel launch overhead (CUDA only, falls back to eager)")
     args = ap.parse_args()
 
-    # 加载预测器
+    # Load predictors
     # Model size has to be passed through: load_predictor builds the network from
     # these before loading weights, and a mismatch is a hard size error, not a
     # strict=False warning. Without them arena can only ever evaluate
@@ -62,12 +62,12 @@ def main():
 
     results = []
     for g in range(args.games):
-        # 颜色对称：偶数局 new=White, 奇数局 new=Black
+        # Colour symmetry: the new model plays White on even games, Black on odd ones.
         if g % 2 == 0:
             res = play_game(p_new, p_old, args.sims, args.temperature_moves)
         else:
             res = play_game(p_old, p_new, args.sims, args.temperature_moves)
-            # 翻转视角统计：把 result 变成“新模型”的结果
+            # Flip the result so it is always from the new model's point of view.
             if res == "1-0":
                 res = "0-1"
             elif res == "0-1":

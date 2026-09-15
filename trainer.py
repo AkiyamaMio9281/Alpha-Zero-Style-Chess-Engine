@@ -14,13 +14,14 @@ import torch.optim as optim
 
 from model import AlphaZeroChess, ModelConfig, ACTION_SIZE, load_model
 
-# ==== 数据迭代器：随机抽样自博弈分片 ====
+# ==== Dataset: random samples from self-play shards ====
 class SelfPlayDataset:
     """
-    从目录下的 .npz 分片中随机采样样本 (feats[C,8,8], pi[4672], z[1])。
-    递归查找子目录（如 gen1/, gen2/, ...），所以既可以指向单个分片目录，
-    也可以指向多轮自对弈数据的根目录，实现跨代的经验回放。
-    支持动态 padding/裁剪特征通道到 in_planes。
+    Randomly samples (feats[C,8,8], pi[4672], z[1]) from the .npz shards under a
+    directory. Subdirectories (gen1/, gen2/, ...) are searched recursively, so it can
+    point at a single shard directory or at the root of several generations of
+    self-play data, giving a replay window across generations. Feature channels are
+    padded or cropped to in_planes on the fly.
     """
     def __init__(self, shards_dir: str, in_planes: int = 102, max_cached_files: int = 64):
         self.files = sorted(glob.glob(os.path.join(shards_dir, "**", "*.npz"), recursive=True))
@@ -31,7 +32,7 @@ class SelfPlayDataset:
         self._cache: "OrderedDict[str, Dict[str, np.ndarray]]" = OrderedDict()
 
     def __len__(self):
-        # 不能准确返回全集大小；训练时用 steps_per_epoch 控制
+        # The true dataset size is not known; training length is set by steps_per_epoch.
         return 10**9
 
     def _load_file(self, path: str) -> Dict[str, np.ndarray]:
@@ -71,7 +72,7 @@ class SelfPlayDataset:
             for _ in range(base + (1 if g < extra else 0)):
                 i = random.randrange(n)
                 x = arr["feats"][i]  # (C?,8,8)
-                # 调整到 in_planes：不足则 0-pad，超出则裁剪
+                # Fit to in_planes: zero-pad when short, crop when long.
                 C = x.shape[0]
                 if C < self.in_planes:
                     pad = np.zeros((self.in_planes - C, 8, 8), dtype=x.dtype)
@@ -83,7 +84,7 @@ class SelfPlayDataset:
                 zs.append(np.float32(arr["z"][i]))             # ()
         return np.stack(xs), np.stack(ps), np.asarray(zs)
 
-# ==== 训练 ====
+# ==== Training ====
 def train_one_epoch(
     model: AlphaZeroChess,
     dataset: SelfPlayDataset,
@@ -96,7 +97,7 @@ def train_one_epoch(
     files_per_batch: int = 16,
 ) -> Dict[str, float]:
     model.train()
-    ce = nn.KLDivLoss(reduction="batchmean")  # 使用 KLDiv 与 soft targets（等价于 CE with soft labels）
+    ce = nn.KLDivLoss(reduction="batchmean")  # KL against soft targets; same gradients as CE with soft labels
     mse = nn.MSELoss()
     log_softmax = nn.LogSoftmax(dim=1)
 
@@ -112,7 +113,7 @@ def train_one_epoch(
 
         logits, v = model(x)  # (B,4672),(B,)
         logp = log_softmax(logits)  # (B,4672)
-        # KLDivLoss 期望 input=log_probs, target=probs
+        # KLDivLoss expects input=log-probabilities, target=probabilities.
         policy_loss = ce(logp, pi)
         value_loss = mse(v, z)
         loss = policy_loss + value_weight * value_loss
@@ -145,17 +146,18 @@ def _parse_milestones(spec: str) -> List[int]:
 
 
 def lr_at_step(base_lr: float, global_step: int, milestones: List[int], lr_min: float) -> float:
-    """阶梯衰减，以累计 global_step 为准，而不是以“第几次 resume”为准。
+    """Step decay keyed on cumulative global_step, not on how many times training resumed.
 
-    旧实现是 base_lr / 10**epoch_index，而 epoch_index 直接取自断点
-    checkpoint 里的 epoch 字段，所以每次 --resume 都会把指数永久推高一截：
-    autoloopexpert.py 每轮迭代 resume 一次、跑 2 个 epoch，从 model_ep3 接着练的
-    话 lr 依次是 2e-4、2e-5（第 1 轮），2e-6、2e-7（第 2 轮），不到十几轮
-    就彻底数值死掉——而循环依旧打印正常的 loss、照常存 checkpoint。
+    The old schedule was base_lr / 10**epoch_index, with epoch_index taken straight
+    from the resumed checkpoint's epoch field, so every --resume pushed the exponent
+    up for good. autoloopexpert.py resumes once per iteration and runs 2 epochs, so
+    continuing from model_ep3 the lr went 2e-4, 2e-5 in iteration 1, then 2e-6, 2e-7
+    in iteration 2, and was numerically dead within a dozen iterations -- while the
+    loop kept printing normal losses and saving checkpoints.
 
-    改用 global_step 后，学习率只取决于实际训了多少步：同一段训练拆成
-    几次 resume 都得到相同的 lr。lr_min 再提供一个下界，保证无论里程碑配得
-    多激进，学习率都不会跌到 0。
+    Keyed on global_step, the lr depends only on how much training actually happened:
+    the same training split across any number of resumes gets the same lr. lr_min
+    adds a floor so that however aggressive the milestones, the lr never reaches 0.
     """
     passed = sum(1 for m in milestones if global_step >= m)
     return max(base_lr / (10.0 ** passed), lr_min)
@@ -199,9 +201,9 @@ def main():
     dataset = SelfPlayDataset(args.data, in_planes=args.in_planes)
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
-    # 恢复训练进度：epoch 计数决定学习率阶梯衰减到哪一档，optimizer 状态
-    # （SGD momentum 缓冲）也一并恢复，否则每次 --resume 学习率都会从头衰减、
-    # momentum 也会被清零重来。
+    # Restore training progress. global_step drives the LR schedule (see lr_at_step),
+    # and the optimizer state -- the SGD momentum buffers -- is restored too, or every
+    # --resume would start the momentum over from zero.
     start_epoch = 0
     global_step = 0
     if args.resume and os.path.exists(args.resume):
@@ -221,8 +223,8 @@ def main():
             if start_epoch or global_step:
                 print(f"[trainer] resuming from epoch={start_epoch}, step={global_step}", flush=True)
 
-    # 阶梯衰减：以 global_step 为准，而不是以累计 epoch 为准。后者会让每次
-    # --resume 都把学习率再除一个 10，在 autoloop 里几轮之后就降到 0。
+    # Step decay keyed on global_step rather than cumulative epochs. The latter divided
+    # the lr by another 10 on every --resume and reached 0 within a few autoloop rounds.
     milestones = _parse_milestones(args.lr_milestones)
     if milestones:
         print(f"[trainer] lr schedule: {args.lr:g} / 10^(milestones passed), "

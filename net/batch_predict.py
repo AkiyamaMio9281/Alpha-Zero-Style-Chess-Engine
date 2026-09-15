@@ -31,16 +31,17 @@ class PredictBatcher:
             except queue.Empty:
                 continue
             batch = [first]
-            # 先把已经在队列里的全部排空——这些不需要等。单个调用方一次交
-            # eval_batch_size 个位置时，它们已经全在队列里，再等只是白等。
+            # Drain everything already queued first -- none of it needs waiting for.
+            # When a single caller submits eval_batch_size positions at once they are
+            # all queued already, and waiting any longer is waiting for nothing.
             while len(batch) < self.max_batch:
                 try:
                     batch.append(self.q.get_nowait())
                 except queue.Empty:
                     break
-            # 然后才是真正的凑批窗口，用于等其他线程稍后到达的请求。
-            # max_wait_ms=0 因此表示“只批处理已到达的，从不等待”，而不是以前
-            # 那种会把 batch 直接退化成 1 的陷阱语义。
+            # Only then the real coalescing window, for requests other threads send a
+            # moment later. max_wait_ms=0 therefore means "batch whatever has arrived,
+            # never wait", not the old trap where it collapsed every batch to size 1.
             t0 = time.time()
             while len(batch) < self.max_batch:
                 remain = self.max_wait_ms/1000.0 - (time.time() - t0)
@@ -91,20 +92,21 @@ class PredictBatcher:
         return lg, float(v)
 
 def make_batched_predictor(base_predict, max_batch: int = 128, max_wait_ms: int = 5):
-    """返回与原 predict_fn 相同签名的函数，但内部做批量聚合。
+    """Return a function with the same signature as predict_fn that batches internally.
 
-    整批先全部入队，再统一等待：这样批处理线程一次就能看到调用方的全部请求，
-    合并成一次 base_predict 调用。原实现逐个 predict_one（提交即阻塞），
-    一批 N 个位置会被拆成 N 次 batch=1 的前向，还要各自吃满 max_wait_ms 的
-    凑批窗口——正是批处理本该消除的开销。
+    The whole group is queued before any of it is waited on, so the batching thread
+    sees every request from the caller at once and merges them into one base_predict
+    call. The original called predict_one per position -- submit, then block -- which
+    split a group of N into N batch-of-1 forward passes, each also paying the full
+    max_wait_ms window: exactly the overhead batching exists to remove.
     """
     batcher = PredictBatcher(base_predict, max_batch=max_batch, max_wait_ms=max_wait_ms)
     def predict(feats_batch: List[np.ndarray]):
         if not feats_batch:
             # np.stack([]) raises; mirror predict.py's empty-batch shapes.
             return np.zeros((0, 4672), dtype=np.float32), np.zeros((0,), dtype=np.float32)
-        reqs = [batcher.submit(x) for x in feats_batch]      # 全部入队
-        outs = [batcher.wait_result(r) for r in reqs]        # 再统一收
+        reqs = [batcher.submit(x) for x in feats_batch]      # queue all of them
+        outs = [batcher.wait_result(r) for r in reqs]        # then collect
         return (np.stack([lg for lg, _ in outs]),
                 np.asarray([v for _, v in outs], dtype=np.float32))
     return predict
