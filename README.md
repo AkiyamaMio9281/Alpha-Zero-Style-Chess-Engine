@@ -1,5 +1,7 @@
 # az_chess
 
+[![tests](https://github.com/AkiyamaMio9281/Alpha-Zero-Style-Chess-Engine/actions/workflows/tests.yml/badge.svg)](https://github.com/AkiyamaMio9281/Alpha-Zero-Style-Chess-Engine/actions/workflows/tests.yml)
+
 AlphaZero-style chess training loop in Python:
 - ResNet policy/value network (4672-action policy head)
 - PUCT MCTS guided by the network
