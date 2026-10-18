@@ -13,6 +13,11 @@ from engine import (
     index_to_move,
     board_outcome_to_z,
 )
+from kernels.reference import masked_softmax_ref
+
+# The softmax _finish_expand applies to the legal moves' logits. Held in a
+# module-level name so bench/profile_search.py can swap implementations.
+_legal_softmax = masked_softmax_ref
 
 # ========= Interfaces & Config =========
 class Evaluator(Protocol):
@@ -390,15 +395,9 @@ class MCTS:
             for a in legal_idx:
                 pri[a] = p
         else:
-            x = np.full((ACTION_SIZE,), -1e9, dtype=np.float32)
-            x[np.array(legal_idx, dtype=np.int32)] = 0.0
-            x = logits + x
-            x = x - np.max(x)
-            ex = np.exp(x).astype(np.float32)
-            s = ex.sum()
-            probs = ex / s if s > 0 else np.ones_like(ex) / len(ex)
-            for a in legal_idx:
-                pri[a] = float(probs[a])
+            probs = _legal_softmax(logits, np.array(legal_idx, dtype=np.int32))
+            for a, p in zip(legal_idx, probs.tolist()):
+                pri[a] = p
 
         node.P = pri
         node.expanded = True
