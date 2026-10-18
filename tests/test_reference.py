@@ -44,7 +44,9 @@ def test_reference_bit_identical_to_original_code(fen):
 
 
 @pytest.mark.parametrize("fen", FENS.values(), ids=FENS.keys())
-def test_finish_expand_priors_bit_identical_to_original_code(fen):
+def test_finish_expand_priors_match_original_code(fen):
+    """_finish_expand now uses the compact softmax, so it agrees with the
+    original to a few ulps rather than bit for bit."""
     board = chess.Board(fen)
     legal_idx = _legal_idx(fen)
     logits = np.random.default_rng(0).normal(0, 3, ACTION_SIZE).astype(np.float32)
@@ -52,7 +54,10 @@ def test_finish_expand_priors_bit_identical_to_original_code(fen):
     node = Node()
     MCTS(predict_fn=None, mcts_cfg=MCTSConfig())._finish_expand(node, board, logits)
 
-    assert node.P == _original_softmax(logits, legal_idx)  # exact, not approx
+    original = _original_softmax(logits, legal_idx)
+    assert node.P.keys() == original.keys()
+    for a, p in original.items():
+        assert node.P[a] == pytest.approx(p, rel=1e-6, abs=1e-9)
 
 
 @pytest.mark.parametrize("fen", FENS.values(), ids=FENS.keys())

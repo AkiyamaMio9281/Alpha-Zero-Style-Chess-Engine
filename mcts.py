@@ -13,11 +13,14 @@ from engine import (
     index_to_move,
     board_outcome_to_z,
 )
-from kernels.reference import masked_softmax_ref
+from kernels.reference import masked_softmax_compact
 
 # The softmax _finish_expand applies to the legal moves' logits. Held in a
 # module-level name so bench/profile_search.py can swap implementations.
-_legal_softmax = masked_softmax_ref
+# Gather-first rather than the original full-row softmax (masked_softmax_ref):
+# same priors to a few ulps, at about 40% of the cost -- 26-32 us -> 9-15 us
+# per expansion, measured in bench/profile_search.py.
+_legal_softmax = masked_softmax_compact
 
 # ========= Interfaces & Config =========
 class Evaluator(Protocol):
