@@ -126,24 +126,44 @@ Measured before writing either (`bench/profile_search.py`): the softmax took
 legal logits before the softmax, still in NumPy, cut its cost 2–3x and is
 what MCTS uses now.
 
-Kernel time on the GPU (fp16 logits, `do_bench` median, RTX 5090 Laptop under
-WSL2; measured peak DRAM bandwidth 687 GB/s):
+Kernel time on the GPU (fp16 logits, `do_bench` median with L2 flushed,
+RTX 5090 Laptop under WSL2). Both tables are from one run:
 
-| batch | torch eager | torch.compile | v1 dense | v2 gather | v1 % of peak bandwidth |
-|---|---|---|---|---|---|
-| 1 | 24.4 µs | 7.9 µs | 7.4 µs | 6.4 µs | 1% |
-| 8 | 25.8 µs | 7.9 µs | 7.9 µs | 7.3 µs | 5% |
-| 64 | 27.9 µs | 7.9 µs | 8.3 µs | 7.6 µs | 37% |
-| 256 | 48.4 µs | 12.1 µs | 12.4 µs | 7.9 µs | 98% |
+| batch | dense working set | torch eager | torch.compile | v1 dense | v2 gather | v1 bandwidth |
+|---|---|---|---|---|---|---|
+| 1 | 0.03 MB* | 22.3 µs | 7.9 µs | 5.9 µs | 5.9 µs | 6 GB/s |
+| 8 | 0.2 MB* | 24.3 µs | 7.9 µs | 6.0 µs | 5.9 µs | 44 GB/s |
+| 64 | 2.0 MB* | 24.4 µs | 7.9 µs | 7.9 µs | 5.9 µs | 265 GB/s |
+| 256 | 8.0 MB* | 40.7 µs | 16.1 µs | 10.0 µs | 6.0 µs | 839 GB/s* |
+| 1024 | 32 MB* | 110.2 µs | 46.8 µs | 26.4 µs | 7.9 µs | 1270 GB/s* |
+| 4096 | 128 MB | 800.4 µs | 183.0 µs | 157.4 µs | 14.1 µs | 851 GB/s |
+
+\* The working set fits in the 64 MB L2. `do_bench` flushes L2 before each
+run, but part of the output is still in L2 when the kernel finishes, so
+these rows overstate DRAM bandwidth; 1270 GB/s at batch 1024 is not
+physically possible from DRAM. Only batch 4096, at twice the size of L2, is
+a DRAM figure: 851 GB/s is about 95% of the GPU's 896 GB/s spec bandwidth,
+and above the 748 GB/s a 1 GiB device-to-device copy reaches, because v1
+reads more than it writes. Below batch 64 the time is a flat ~6–8 µs of
+launch latency whatever the size, the same latency bound the forward pass
+shows.
+
+v1 is 4–5x faster than PyTorch eager from batch 256 up, and on par with
+`torch.compile`: which of the two is ahead at large batch changes between
+runs (1.2–1.8x ahead at batch 128–4096 in this one, 3–8% behind at batch
+256 in an earlier one), so the gap between them is not a result. v2's
+time barely moves with batch because it touches only the ~31 legal entries
+per row.
 
 End to end, from logits on the GPU to priors on the CPU (wall time):
 
 | batch | NumPy, gather-first | v2 gather, one upload | v2 vs NumPy |
 |---|---|---|---|
-| 1 | 74 µs | 157 µs | 0.47x |
-| 8 | 145 µs | 202 µs | 0.72x |
-| 32 | 293 µs | 168 µs | 1.75x |
-| 256 | 2035 µs | 337 µs | 6.05x |
+| 1 | 89 µs | 192 µs | 0.46x |
+| 8 | 142 µs | 198 µs | 0.72x |
+| 32 | 281 µs | 195 µs | 1.44x |
+| 256 | 1779 µs | 314 µs | 5.66x |
+| 4096 | 45770 µs | 3151 µs | 14.5x |
 
 "One upload" packs the indices and counts into one pinned buffer and copies
 it in a single non-blocking transfer. The kernel wins from batch 32 up. MCTS

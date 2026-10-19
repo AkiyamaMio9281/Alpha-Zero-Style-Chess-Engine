@@ -3,8 +3,14 @@
 
 Step 3 of TRITON_PLAN.md. Produces three tables:
 
-1. Measured peak DRAM bandwidth -- a large device-to-device copy -- used as
-   the roofline ceiling instead of the spec-sheet figure.
+1. Measured DRAM bandwidth of a large device-to-device copy, the ceiling
+   v1 is reported against. It is a copy's ceiling, not the hardware's: on
+   the RTX 5090 Laptop it measures 690-750 GB/s against 896 GB/s on the
+   spec sheet, and v1, which reads more than it writes, can go past it.
+   Rows whose dense working set fits in L2 are starred: there part of the
+   output is still in L2 when the kernel ends, so their bandwidth is not a
+   DRAM figure. Batches 1024 and 4096 are in the default set so that at
+   least one row cannot fit (4096 rows are about 134 MB).
 
 2. Kernel only, GPU time (triton.testing.do_bench, median, L2 flushed
    between runs): torch eager, torch.compile, Triton v1 (dense) and Triton
@@ -97,9 +103,10 @@ def make_batch(pool: List[np.ndarray], B: int, rng: np.random.Generator):
 
 
 def kernel_table(pool, batches, peak, rng) -> None:
-    print("| B | legal/row | eager us | compile us | v1 dense us | v2 gather us | "
-          "eager GB/s | compile GB/s | v1 GB/s (% peak) | v2 GB/s |")
-    print("|---|---|---|---|---|---|---|---|---|---|")
+    l2_bytes = torch.cuda.get_device_properties(DEV).L2_cache_size
+    print("| B | legal/row | dense MB | eager us | compile us | v1 dense us | v2 gather us | "
+          "eager GB/s | compile GB/s | v1 GB/s (% of copy) | v2 GB/s |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|")
     for B in batches:
         logits_np, legal = make_batch(pool, B, rng)
         logits = torch.from_numpy(logits_np).to(DEV)
@@ -128,7 +135,9 @@ def kernel_table(pool, batches, peak, rng) -> None:
         gather_bytes = int(count_np.sum()) * 2 + B * GATHER_BLOCK * 2 + B * 4 + B * GATHER_BLOCK * 4
         gbs = lambda nbytes, us: nbytes / (us * 1e-6) / 1e9
         v1_gbs = gbs(dense_bytes, t_v1)
-        print(f"| {B} | {count_np.mean():.0f} | {t_eager:.1f} | {t_comp:.1f} | {t_v1:.1f} | {t_v2:.1f} | "
+        fits_l2 = "*" if dense_bytes <= l2_bytes else ""
+        print(f"| {B} | {count_np.mean():.0f} | {dense_bytes / 2**20:.1f}{fits_l2} | "
+              f"{t_eager:.1f} | {t_comp:.1f} | {t_v1:.1f} | {t_v2:.1f} | "
               f"{gbs(dense_bytes, t_eager):.0f} | {gbs(dense_bytes, t_comp):.0f} | "
               f"{v1_gbs:.0f} ({100 * v1_gbs / peak:.0f}%) | {gbs(gather_bytes, t_v2):.1f} |", flush=True)
 
@@ -242,7 +251,7 @@ def v2_breakdown_table(pool, batches, iters, rng) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--batches", type=int, nargs="+", default=[1, 8, 32, 64, 128, 256])
+    ap.add_argument("--batches", type=int, nargs="+", default=[1, 8, 32, 64, 128, 256, 1024, 4096])
     ap.add_argument("--iters", type=int, default=300, help="end-to-end samples per path and batch size")
     args = ap.parse_args()
 
@@ -254,9 +263,11 @@ def main() -> None:
           f"{np.mean([len(l) for l in pool]):.0f}, max {max(len(l) for l in pool)})")
     print()
     peak = peak_bandwidth_gbs()
-    print(f"Measured peak DRAM bandwidth (1 GiB device-to-device copy): {peak:.0f} GB/s")
+    l2_mb = torch.cuda.get_device_properties(DEV).L2_cache_size / 2**20
+    print(f"DRAM bandwidth of a 1 GiB device-to-device copy: {peak:.0f} GB/s  (L2: {l2_mb:.0f} MB)")
     print()
-    print("Kernel only, GPU time (do_bench median, L2 flushed):")
+    print("Kernel only, GPU time (do_bench median, L2 flushed). "
+          "* = dense working set fits in L2, so its GB/s is not a DRAM figure:")
     print()
     kernel_table(pool, args.batches, peak, np.random.default_rng(1))
     print()
