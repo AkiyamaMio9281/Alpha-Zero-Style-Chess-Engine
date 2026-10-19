@@ -55,6 +55,12 @@ AlphaZero-style chess training loop in Python:
 - `play_cli.py`  
   Play against a checkpoint from the terminal.
 
+- `kernels/`  
+  The policy-prior softmax over legal moves: NumPy reference and gather-first versions (`reference.py`), and Triton kernels for the GPU (`masked_softmax.py`).
+
+- `bench/`  
+  `profile_search.py` breaks a search's time down by component; `bench_masked_softmax.py` benchmarks the softmax implementations.
+
 ---
 
 ## Requirements
@@ -100,6 +106,52 @@ quietly trains on garbage.
 pip install -r requirements-dev.txt
 pytest
 ```
+
+---
+
+## GPU policy softmax (Triton)
+
+Every node expansion turns 4672 policy logits into priors over the ~30 legal
+moves. `kernels/masked_softmax.py` does this on the GPU in Triton, two ways:
+
+- **v1, dense:** the row softmax with a legal-move mask, one program per
+  row. The bandwidth-bound reference point.
+- **v2, gather:** reads only the legal logits and writes them packed. Legal
+  moves come as a fixed-shape `(B, 256)` index buffer rather than a
+  variable-length list, so the kernel can be captured into the same CUDA
+  graph as the forward pass (tested: replays match eager bit for bit).
+
+Measured before writing either (`bench/profile_search.py`): the softmax took
+2–3% of a search and the logits' device-to-host copy 0.2%. Gathering the
+legal logits before the softmax, still in NumPy, cut its cost 2–3x and is
+what MCTS uses now.
+
+Kernel time on the GPU (fp16 logits, `do_bench` median, RTX 5090 Laptop under
+WSL2; measured peak DRAM bandwidth 687 GB/s):
+
+| batch | torch eager | torch.compile | v1 dense | v2 gather | v1 % of peak bandwidth |
+|---|---|---|---|---|---|
+| 1 | 24.4 µs | 7.9 µs | 7.4 µs | 6.4 µs | 1% |
+| 8 | 25.8 µs | 7.9 µs | 7.9 µs | 7.3 µs | 5% |
+| 64 | 27.9 µs | 7.9 µs | 8.3 µs | 7.6 µs | 37% |
+| 256 | 48.4 µs | 12.1 µs | 12.4 µs | 7.9 µs | 98% |
+
+End to end, from logits on the GPU to priors on the CPU (wall time):
+
+| batch | NumPy, gather-first | v2 gather, one upload | v2 vs NumPy |
+|---|---|---|---|
+| 1 | 74 µs | 157 µs | 0.47x |
+| 8 | 145 µs | 202 µs | 0.72x |
+| 32 | 293 µs | 168 µs | 1.75x |
+| 256 | 2035 µs | 337 µs | 6.05x |
+
+"One upload" packs the indices and counts into one pinned buffer and copies
+it in a single non-blocking transfer. The kernel wins from batch 32 up. MCTS
+here evaluates 1 to 8 positions per call, and there the path's fixed cost --
+each CUDA call costs 35–55 µs of latency under WSL2, whatever its size --
+outweighs the NumPy softmax it replaces, so the search keeps the NumPy path.
+Reproduce with `python bench/bench_masked_softmax.py` (needs Linux, CUDA and
+Triton).
 
 ---
 
